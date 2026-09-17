@@ -411,6 +411,16 @@ def cmd_headroom(a):
             hit_at[m] = (order[:, :mm] == correct[:, None]).any(dim=1) & reach
         row.update(n_unreachable=int((~reach).sum()),
                    **{f"n_top{m}": int(hit_at[m].sum()) for m in TOPK})
+        # "own particle": ANY surviving seed of the hit's true particle (primary or duplicate)
+        st_order = seed_true[order]                            # (n_pop, kmax) truth of nearest seeds
+        for m in TOPK:
+            row[f"n_own_top{m}"] = int((st_order[:, :min(m, K)] == yt[:, None]).any(dim=1).sum())
+        # what is the nearest seed of a hit whose nearest seed is NOT its primary seed?
+        miss = ~hit_at[1]
+        near_t = st_order[:, 0]
+        row.update(n_near_dup=int((miss & reach & (near_t == yt)).sum()),
+                   n_near_other=int((miss & (near_t >= 0) & (near_t != yt)).sum()),
+                   n_near_spurious=int((miss & (near_t < 0)).sum()))
         if K >= 2:
             d2 = torch.topk(Dp, 2, dim=1, largest=False).values
             margins.append(((d2[:, 1] - d2[:, 0]) / d2[:, 1].clamp(min=1e-9)).numpy())
@@ -449,7 +459,9 @@ def summarize_headroom(rows, by_sem, by_size, size_bins, marg, out, a):
     import numpy as np
     g = lambda rs, c: np.array([float(r.get(c, NAN)) for r in rs], dtype=float)
     rs = [r for r in rows if "n_top1" in r]
-    tot = {c: np.nansum(g(rs, c)) for c in ["n_pop", "n_unreachable"] + [f"n_top{m}" for m in TOPK]}
+    tot = {c: np.nansum(g(rs, c)) for c in ["n_pop", "n_unreachable", "n_near_dup", "n_near_other",
+                                               "n_near_spurious"]
+           + [f"n_top{m}" for m in TOPK] + [f"n_own_top{m}" for m in TOPK]}
     npop = max(tot["n_pop"], 1)
     L = [f"# Stage 0 — membership headroom (rule {a.rule}; batches {a.batches}; "
          f"t_d {a.t_d}, t_assign {a.t_assign})", "",
@@ -459,6 +471,14 @@ def summarize_headroom(rows, by_sem, by_size, size_bins, marg, out, a):
     for m in TOPK:
         L.append(f"- correct seed within top-{m}: {tot[f'n_top{m}'] / npop:.3f}"
                  f"  (of reachable: {tot[f'n_top{m}'] / max(npop - tot['n_unreachable'], 1):.3f})")
+    L += ["", "**Own-particle view (any surviving seed of the hit's particle, primary or duplicate)**"]
+    for m in TOPK:
+        L.append(f"- an own-particle seed within top-{m}: {tot[f'n_own_top{m}'] / npop:.3f}")
+    L += ["", "**Nearest seed of hits whose nearest seed is not their primary seed (fractions of all population hits)**",
+          f"- duplicate seed of the same particle: {tot['n_near_dup'] / npop:.3f}",
+          f"- seed of another particle: {tot['n_near_other'] / npop:.3f}",
+          f"- spurious (background-hit) seed: {tot['n_near_spurious'] / npop:.3f}",
+          "(primary-seed rates above count 'duplicate' as a miss; ARI does not, until duplicates are separated.)", ""]
     if marg.size:
         L.append("- relative top-1/top-2 distance margin (d2-d1)/d2: " + "  ".join(
             f"p{p}:{np.percentile(marg, p):.3f}" for p in (10, 25, 50, 75, 90)))
@@ -486,7 +506,10 @@ def summarize_headroom(rows, by_sem, by_size, size_bins, marg, out, a):
         L.append(f"| ({lo_}, {hi_}] | {s['n']} | {s['unreach']/s['n']:.3f} | "
                  + " | ".join(f"{s[m]/s['n']:.3f}" for m in TOPK) + " |")
     L += ["", "Reading: top-M >> top-1 with low 'unreachable' => soft membership / refinement has "
-          "headroom; low top-M or high 'unreachable' => the seed set or the latent is the bottleneck."]
+          "headroom; low top-M or high 'unreachable' => the seed set or the latent is the bottleneck. "
+          "'Seed of another particle' is what soft membership can fix; 'duplicate seed' is a "
+          "duplicate-suppression problem. Oracle ARI is not monotonic in M: moving part of a "
+          "particle from a duplicate seed to its primary seed splits it."]
     text = "\n".join(L)
     (out / f"headroom_summary_{a.rule.replace(':', '_')}.md").write_text(text + "\n")
     print(text)
