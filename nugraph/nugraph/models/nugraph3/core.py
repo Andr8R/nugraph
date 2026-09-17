@@ -34,6 +34,8 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
             nn.Linear(out_features, out_features),
             nn.Mish())
 
+        self.norm = nn.LayerNorm(out_features)
+
     def forward(self, x: T, edge_index: T) -> T: # pylint: disable=arguments-differ
         """
         NuGraphBlock forward pass
@@ -72,7 +74,7 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
         """
         if isinstance(x, tuple):
             _, x = x
-        return self.net(torch.cat((aggr_out, x), dim=1))
+        return self.norm(self.net(torch.cat((aggr_out, x), dim=1)))
 
 class NuGraphCore(nn.Module):
     """
