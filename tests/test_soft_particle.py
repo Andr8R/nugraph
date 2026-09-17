@@ -3,6 +3,7 @@
 CPU only, no cache and no GPU needed.  Run:  pytest -q tests/test_soft_particle.py
 """
 import importlib.util
+import warnings
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,13 @@ pytest.importorskip("torch_scatter")
 pytest.importorskip("sklearn")
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _deterministic():
+    """torch seeds its default generator per process, so model init would otherwise
+    differ between runs (this made the merge test flaky)."""
+    torch.manual_seed(12345)
 
 
 def _load(name, path):
@@ -103,25 +111,40 @@ def test_loss_is_finite_and_differentiable():
 
 
 def test_merge_all_gives_one_cluster_merge_none_keeps_candidates(monkeypatch):
+    """Merging only. exist_thr=0 keeps every candidate alive, so an untrained
+    existence head cannot influence the result (that is tested separately)."""
     d = prep()
     model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
-    real = model.merge_logits
     monkeypatch.setattr(model, "merge_logits",
                         lambda c, cen, pairs, w=None, nb=None: torch.full((pairs.size(0),), 9.0))
-    lab, diag = sp.predict_labels(model, d, allow_null=False)
+    lab, diag = sp.predict_labels(model, d, exist_thr=0.0, allow_null=False)
     assert diag["n_groups"] == 1 and set(lab.tolist()) == {0}
     monkeypatch.setattr(model, "merge_logits",
                         lambda c, cen, pairs, w=None, nb=None: torch.full((pairs.size(0),), -9.0))
-    lab2, diag2 = sp.predict_labels(model, d, allow_null=False)
-    assert diag2["n_groups"] == len(set(lab2.tolist())) <= d["K"]
+    lab2, diag2 = sp.predict_labels(model, d, exist_thr=0.0, allow_null=False)
     assert (lab2 >= 0).all()                                  # no null when allow_null=False
+    assert diag2["n_groups"] == len(set(lab2.tolist())) <= d["K"]
 
 
 def test_existence_threshold_can_drop_candidates():
+    """exist_thr above 1 drops every candidate whatever the (untrained) scores are."""
     d = prep()
     model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
     lab, diag = sp.predict_labels(model, d, exist_thr=1.1, allow_null=False)   # nothing survives
     assert diag["n_groups"] == 0 and (lab == -1).all()
+
+
+def test_reported_scalars_do_not_warn_about_grad():
+    """Regression: float() on grad-carrying tensors emitted a UserWarning."""
+    d = prep()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, parts = sp.event_loss(model, d)
+        lab, diag = sp.predict_labels(model, d, exist_thr=0.0, allow_null=False)
+    assert all(isinstance(v, float) for v in parts.values())
+    assert not lab.requires_grad
+    assert [w for w in caught if "requires_grad" in str(w.message)] == []
 
 
 def test_labels_are_contiguous_and_cover_foreground():

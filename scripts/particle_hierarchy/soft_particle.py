@@ -214,15 +214,25 @@ def event_loss(model, d, w_exist=1.0, w_merge=1.0):
         w = lg.softmax(dim=1)[:, :-1]
         loss_mg = F.binary_cross_entropy_with_logits(
             model.merge_logits(c, cen, pairs, w, d["nb"]), tgt)
-    return loss_mem + w_exist * loss_ex + w_merge * loss_mg, {
-        "mem": float(loss_mem), "exist": float(loss_ex), "merge": float(loss_mg)}
+    total = loss_mem + w_exist * loss_ex + w_merge * loss_mg
+    return total, {"mem": float(loss_mem.detach()), "exist": float(loss_ex.detach()),
+                   "merge": float(loss_mg.detach())}
 
 
 # --------------------------------------------------------------------------- #
 # inference
 # --------------------------------------------------------------------------- #
 def predict_labels(model, d, merge_thr=0.5, exist_thr=0.5, allow_null=True):
-    """Hard labels over foreground hits (-1 = unassigned) + diagnostics."""
+    """Hard labels over foreground hits (-1 = unassigned) + diagnostics.
+
+    Inference only: runs under no_grad, so the returned tensors never carry gradients.
+    """
+    import torch
+    with torch.no_grad():
+        return _predict_labels(model, d, merge_thr, exist_thr, allow_null)
+
+
+def _predict_labels(model, d, merge_thr, exist_thr, allow_null):
     import torch
     lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
     w = lg.softmax(dim=1)
@@ -326,7 +336,7 @@ def cmd_train(a):
         for j, i in enumerate(perm.tolist()):
             loss, p = event_loss(model, to_device(train[i], dev), a.w_exist, a.w_merge)
             (loss / a.accum).backward()
-            tot += float(loss); n += 1
+            tot += float(loss.detach()); n += 1
             for k in p: parts[k] += p[k]
             if (j + 1) % a.accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -443,7 +453,7 @@ def cmd_selftest(a):
         tot = 0.0
         for d in events:
             loss, _ = event_loss(model, d)
-            opt.zero_grad(); loss.backward(); opt.step(); tot += float(loss)
+            opt.zero_grad(); loss.backward(); opt.step(); tot += float(loss.detach())
         first = tot / len(events) if first is None else first
         last = tot / len(events)
     model.eval()
