@@ -160,13 +160,17 @@ def cmd_cache(a):
     nudata = ng.data.H5DataModule(a.data_path, batch_size=a.batch_size,
                                   model=ng.models.NuGraph3, shuffle="balance",
                                   num_workers=0, featext=False)
+    loader = {"train": nudata.train_dataloader, "validation": nudata.val_dataloader,
+              "test": nudata.test_dataloader}[a.split]()
     lo, hi = parse_range(a.batches)
     manifest = {"checkpoint": a.checkpoint, "checkpoint_sha256": sha256(a.checkpoint),
                 "repo": str(repo), "git_commit": commit, "tree_clean": not diff,
                 "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
                 "layernorm_blocks": sum(hasattr(m, "norm") for m in model.core_net.children()),
-                "data_path": a.data_path, "split": "validation", "batch_size": a.batch_size,
-                "batches": a.batches, "torch": torch.__version__,
+                "data_path": a.data_path, "split": a.split, "batch_size": a.batch_size,
+                "batches": a.batches, "limit_events": a.limit_events,
+                "store_hit_x": a.store_hit_x, "shuffle": "balance",
+                "torch": torch.__version__,
                 "gpu": torch.cuda.get_device_name(dev),
                 "hparams": {k: hp[k] for k in ("in_features", "coord_features",
                             "instance_features", "semantic_classes", "use_checkpointing")},
@@ -179,7 +183,8 @@ def cmd_cache(a):
     bw.writerow(["batch", "n_graphs", "n_hits", "nugraph_ari", "forward_s"])
     shard, shard_id, t_all = [], 0, time.perf_counter()
     torch.cuda.reset_peak_memory_stats(dev)
-    for bi, batch in enumerate(nudata.val_dataloader()):
+    n_events = 0
+    for bi, batch in enumerate(loader):
         if bi < lo:
             continue
         if hi is not None and bi >= hi:
@@ -198,26 +203,36 @@ def cmd_cache(a):
         y_i = data.y_i().to(torch.int32).cpu()
         x_ng = data.x_i().to(torch.int32).cpu()
         ysem = h.y_semantic.to(torch.int8).cpu()
+        # hit embedding of FOREGROUND hits only (float16): Stage-1 membership features.
+        # Rows follow mask.nonzero() order within the event.
+        hx = h.x.detach().to(torch.float16).cpu() if a.store_hit_x else None
         ptr = h.ptr.cpu().tolist()
         for g in range(data.num_graphs):
             s = slice(ptr[g], ptr[g + 1])
-            shard.append({"batch": bi, "event": g, "ox": ox[s].clone(),
-                          "beta": beta[s].clone(), "mask": mask[s].clone(),
-                          "y_i": y_i[s].clone(), "y_sem": ysem[s].clone(),
-                          "x_nugraph": x_ng[s].clone()})
+            ev = {"batch": bi, "event": g, "ox": ox[s].clone(),
+                  "beta": beta[s].clone(), "mask": mask[s].clone(),
+                  "y_i": y_i[s].clone(), "y_sem": ysem[s].clone(),
+                  "x_nugraph": x_ng[s].clone()}
+            if hx is not None:
+                ev["hit_x_fg"] = hx[s][mask[s]].clone()
+            shard.append(ev)
+            n_events += 1
         bw.writerow([bi, data.num_graphs, h.num_nodes,
                      float(metrics["instance/adjusted-rand-test"]), f"{t_fwd:.6f}"])
         if len(shard) >= a.shard_events:
             torch.save(shard, out / f"shard_{shard_id:04d}.pt")
             shard, shard_id = [], shard_id + 1
             bfile.flush()
+        if a.limit_events and n_events >= a.limit_events:
+            print(f"  reached --limit-events {a.limit_events} after batch {bi}", flush=True)
+            break
         if bi % 25 == 0:
             print(f"  cache batch {bi}  fwd {t_fwd:.2f}s  "
                   f"peak {torch.cuda.max_memory_allocated(dev)/1e9:.2f} GB", flush=True)
     if shard:
         torch.save(shard, out / f"shard_{shard_id:04d}.pt")
     bfile.close()
-    manifest.update(finished=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    manifest.update(finished=time.strftime("%Y-%m-%dT%H:%M:%S"), n_events=n_events,
                     wall_s=round(time.perf_counter() - t_all, 1),
                     forward_peak_alloc_gb=round(torch.cuda.max_memory_allocated(dev) / 1e9, 3))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -803,7 +818,13 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--device", type=int, default=0)
     s.add_argument("--batch-size", type=int, default=8)
-    s.add_argument("--batches", default="0:", help="validation batch range lo:hi")
+    s.add_argument("--batches", default="0:", help="batch range lo:hi within the split")
+    s.add_argument("--split", default="validation",
+                   choices=("train", "validation", "test"))
+    s.add_argument("--limit-events", type=int, default=0,
+                   help="stop after this many cached events (0 = no limit)")
+    s.add_argument("--store-hit-x", action="store_true",
+                   help="also store foreground hit embeddings (float16) for Stage-1 training")
     s.add_argument("--shard-events", type=int, default=400)
     s.add_argument("--allow-dirty", action="store_true")
     s.set_defaults(fn=cmd_cache)
