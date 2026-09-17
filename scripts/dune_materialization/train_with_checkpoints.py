@@ -1,0 +1,156 @@
+#!/usr/bin/env python
+"""Training launcher used for the DUNE LayerNorm runs.
+
+Identical to scripts/train.py except that, with the tensorboard logger, it keeps one
+checkpoint per epoch plus last.ckpt and the best checkpoint by loss/val (upstream only
+checkpoints for wandb), and it exposes --gradient-clip-val (default off; not used by the
+final run). Resume with --resume <.../checkpoints/last.ckpt>: the saved hyperparameters
+are restored from the checkpoint, the data module is rebuilt from the command line.
+"""
+import os
+import argparse
+import pathlib
+import signal
+import warnings
+
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.plugins.environments import SLURMEnvironment
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+import nugraph as ng
+
+torch.set_num_threads(4)
+torch.set_float32_matmul_precision('high')
+warnings.filterwarnings('ignore', '.*TypedStorage is deprecated.*')
+
+Data = ng.data.H5DataModule
+
+def configure():
+    # select model class before adding model-specific args
+    ng2 = '--nugraph2' in __import__('sys').argv
+    Model = ng.models.NuGraph2 if ng2 else ng.models.NuGraph3
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--nugraph2', action='store_true', default=False,
+                        help='Train NuGraph2 instead of NuGraph3 (default)')
+    parser.add_argument('--device', type=int, default=None,
+                        help="Index of GPU device to train with")
+    parser.add_argument('--logger', type=str, default="tensorboard",
+                        choices=("wandb", "tensorboard"),
+                        help="Which logging method to use")
+    parser.add_argument('--name', type=str, default=None,
+                        help='Training instance name, for logging purposes')
+    parser.add_argument('--version', type=str, default=None,
+                        help='Training version name, for logging purposes')
+    parser.add_argument("--project", type=str, default="nugraph3",
+                        help="wandb project to log to")
+    parser.add_argument("--resume", type=str,
+                        help="model checkpoint file to resume training with")
+    parser.add_argument("--offline", action="store_true",
+                        help="write wandb logs offline")
+    parser.add_argument('--profiler', type=str, default=None,
+                        help='Enable requested profiler')
+    parser.add_argument('--precision', type=str, default='32',
+                        choices=('32', 'bf16-mixed'),
+                        help='Precision for training (default: 32, or bf16-mixed for AMP)')
+    parser.add_argument('--gradient-clip-val', type=float, default=None,
+                        help='Gradient-norm clipping value (default: None = no clipping). '
+                             'Launcher-only; passed straight to pl.Trainer.')
+    parser = Data.add_data_args(parser)
+    parser = Model.add_model_args(parser)
+    return parser.parse_args(), Model
+
+def train(args, Model):
+
+    torch.manual_seed(1)
+
+    # Load dataset
+    nudata = Data(args.data_path, batch_size=args.batch_size,
+                  model=Model, shuffle=args.shuffle,
+                  balance_frac=args.balance_frac, num_workers=args.num_workers,
+                  featext=args.featext)
+
+    if args.resume:
+        model = Model.load_from_checkpoint(args.resume)
+    else:
+        model = Model.from_args(args, nudata)
+
+    # Configure logger
+    if args.logger == "wandb":
+        logdir = pathlib.Path(os.environ["NUGRAPH_LOG"])/args.name
+        logdir.mkdir(parents=True, exist_ok=True)
+        log_model = False if args.offline else "all"
+        logger = pl.loggers.WandbLogger(
+            save_dir=logdir,
+            project=args.project,
+            name=args.name,
+            version=args.version,
+            log_model=log_model,
+            offline=args.offline
+        )
+        warnings.warn(('The "wandb" logging option is deprecated, and will be '
+                       'removed in a future nugraph version! Please switch '
+                       'your workflow to use tensorboard logging.'))
+    elif args.logger == "tensorboard":
+        logdir = os.environ["NUGRAPH_LOG"]
+        logger = pl.loggers.TensorBoardLogger(
+            save_dir=logdir,
+            name=args.name,
+            version=args.version,
+            default_hp_metric=False
+        )
+    else:
+        raise RuntimeError(f'Logger option "{args.logger}" not recognized!')
+
+    # configure callbacks
+    callbacks = []
+    if logger:
+        callbacks.append(LearningRateMonitor(logging_interval='step'))
+
+        ckpt_dir = pathlib.Path(logger.log_dir) / "checkpoints"
+
+        # Keep one checkpoint for every completed epoch + deterministic last.ckpt.
+        callbacks.append(ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="epoch={epoch:02d}-step={step}",
+            auto_insert_metric_name=False,
+            save_top_k=-1,
+            every_n_epochs=1,
+            save_last=True,
+        ))
+
+        # Separately keep the best checkpoint by validation loss.
+        callbacks.append(ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="best-epoch={epoch:02d}-step={step}",
+            auto_insert_metric_name=False,
+            monitor="loss/val",
+            mode="min",
+            save_top_k=1,
+            every_n_epochs=1,
+        ))
+
+    # configure plugins
+    plugins = [
+        SLURMEnvironment(),
+    ]
+
+    accelerator, devices = ng.util.configure_device(args.device)
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        max_epochs=args.epochs,
+        limit_train_batches=args.limit_train_batches,
+        limit_val_batches=args.limit_val_batches,
+        gradient_clip_val=args.gradient_clip_val,
+        logger=logger,
+        profiler=args.profiler,
+        callbacks=callbacks,
+        plugins=plugins,
+    )
+
+    trainer.fit(model, datamodule=nudata, ckpt_path=args.resume)
+
+if __name__ == '__main__':
+    args, Model = configure()
+    train(args, Model)
