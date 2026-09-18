@@ -165,19 +165,132 @@ def test_store_and_device_roundtrip_preserves_values():
     assert back["hit_x"].dtype == torch.float32
 
 
-def test_perfect_features_are_learnable_end_to_end():
+def with_duplicate():
+    """Event where particle 0 has a second (duplicate) seed at hit 5, 1.0 away from its primary."""
+    ev = make_event()
+    ev["ox"][5] = ev["ox"][0] + torch.nn.functional.one_hot(torch.tensor(1), 8).float()
+    ev["beta"][5] = 0.8
+    return prep(ev)
+
+
+def test_own_target_accepts_duplicate_seed():
+    d = with_duplicate()
+    assert d["K"] == 4
+    assert d["exist_t"].sum() == 3 and d["exist_real"].sum() == 4   # duplicate is real, not primary
+    # hit 5 sits on the duplicate (nearest) and next to the primary: both columns are "own"
+    assert d["own"][5, 0] and d["own"][5, 1] and not d["own"][5, 2]
+    assert d["target"][5] == 1                                         # primary-only target
+    assert not d["own"][d["target"] == d["m"]].any()                  # background has no own column
+
+
+def test_own_membership_loss_is_finite_and_differentiable():
+    d = with_duplicate()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    loss, _ = sp.event_loss(model, d, target="own", exist_target="real", merge_scope="local")
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_own_loss_equals_cross_entropy_with_single_positive():
+    d = prep()                                                         # no duplicates
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    lg = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])[0]
+    assert torch.allclose(sp.membership_loss(lg, d, "own"), sp.membership_loss(lg, d, "primary"),
+                          atol=1e-5)
+
+
+def test_local_pairs_are_candidates_sharing_a_neighbourhood():
+    nb = torch.tensor([[0, 1, 2], [1, 3, 0]])
+    p = sp.candidate_pairs(nb, 5, "local", DEV)
+    assert {tuple(x) for x in p.tolist()} == {(0, 1), (0, 2), (1, 2), (1, 3), (0, 3)}
+    assert sp.candidate_pairs(nb, 5, "all", DEV).size(0) == 10
+
+
+def _fixed_existence(monkeypatch, model, e_fixed):
+    real = model.forward
+
+    def fake(*args):
+        lg, c, cen, _ = real(*args)
+        return lg, c, cen, e_fixed
+    monkeypatch.setattr(model, "forward", fake)
+
+
+def test_reassign_sends_hits_to_a_surviving_candidate(monkeypatch):
+    d = prep()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    _fixed_existence(monkeypatch, model, torch.tensor([9.0, -9.0, 9.0]))   # candidate 1 dead
+    kw = dict(merge_thr=None, exist_thr=0.5, allow_null=False)
+    lab, diag = sp.predict_labels(model, d, reassign=True, **kw)
+    assert (lab >= 0).all() and diag["n_groups"] == 2 and diag["n_keep"] == 2
+    lab1, _ = sp.predict_labels(model, d, reassign=False, **kw)
+    assert (lab1[40:80] == -1).all() and (lab1[:40] >= 0).all()           # v1 drops particle 1
+
+
+def test_keep_one_prevents_no_cluster(monkeypatch):
+    d = prep()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    _fixed_existence(monkeypatch, model, torch.tensor([-9.0, -8.0, -9.0]))  # all dead
+    kw = dict(merge_thr=None, exist_thr=0.5, allow_null=False, reassign=True)
+    _, diag = sp.predict_labels(model, d, keep_one=False, **kw)
+    assert diag["n_groups"] == 0
+    lab, diag = sp.predict_labels(model, d, keep_one=True, **kw)
+    assert diag["n_keep"] == 1 and diag["n_groups"] == 1 and (lab == 0).all()
+
+
+def test_nearest_decode_reproduces_hard_seed_partition():
+    d = prep(make_event(sep=1.0, std=0.5))                                 # overlapping blobs
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    lab, _ = sp.predict_labels(model, d, merge_thr=None, exist_thr=None, allow_null=False,
+                               nearest=True)
+    hard = d["hard_labels"]
+    assert torch.equal(lab[:, None] == lab[None, :], hard[:, None] == hard[None, :])
+
+
+def test_v1_preset_matches_legacy_keyword_defaults():
+    d = prep()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    a, _ = sp.predict_labels(model, d)
+    b, _ = sp.predict_labels(model, d, **sp.PRESETS["v1"])
+    assert torch.equal(a, b)
+
+
+def test_diagnostics_run_and_nearest_matches_hard_seed():
+    d = with_duplicate()
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    model.eval()
+    rows = sp.diagnose_event(model, d)
+    assert [r["variant"] for r in rows] == [v[0] for v in sp.VARIANTS]
+    near = next(r for r in rows if r["variant"] == "nearest")
+    assert abs(near["ari_particle"] - near["ari_hardseed"]) < 1e-12
+    assert model.dist_only is False                                        # restored
+    summ = sp.summarize_variants(rows)
+    assert set(summ) == {v[0] for v in sp.VARIANTS}
+    st = sp.head_stats(model, d)
+    assert st["n_pop"] == 120 and st["n_bkg"] == 10 and st["own_local"] == 120
+    assert st["all_pos"] == 1 and st["real_particles"] == 3                # one duplicate pair
+    heads = sp.summarize_stats(st)
+    assert heads["membership"]["own_in_topM"] == 1.0
+
+
+@pytest.mark.parametrize("cfg", [
+    dict(train={}, decode={}),
+    dict(train=dict(target="own", exist_target="real", merge_scope="local"),
+         decode=sp.PRESETS["v2"]),
+])
+def test_perfect_features_are_learnable_end_to_end(cfg):
     """With one-hot true-particle features the decoder must reach a high ARI."""
     events = [prep(make_event(seed=s)) for s in range(6)]
     model = sp.build_model(events[0]["hit_x"].size(1), 8, 32, 2)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
     for _ in range(25):
         for d in events:
-            loss, _ = sp.event_loss(model, d)
+            loss, _ = sp.event_loss(model, d, **cfg["train"])
             opt.zero_grad(); loss.backward(); opt.step()
     model.eval()
     with torch.no_grad():
         d = events[0]
-        lab, _ = sp.predict_labels(model, d)
+        lab, _ = sp.predict_labels(model, d, **cfg["decode"])
         full = torch.full((d["n_hit"],), -1, dtype=torch.long)
         full[d["fg_idx"]] = lab
         q = sp.mb.event_quality(full, d["y_i"], d["y_sem"], d["fg"] & (d["y_sem"] >= 0))

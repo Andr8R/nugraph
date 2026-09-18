@@ -15,9 +15,19 @@ Per event:
   existence    learned per-candidate score; lets the model switch candidates off
   hard output  only at inference: merge, then assign each hit to its best surviving candidate
 
-  train      train on a TRAIN-split cache, monitor on dev-A
+  train      train on a TRAIN-split cache, monitor on dev-A (saves last, best-on-dev-A, per epoch)
   eval       evaluate a trained head on a cache range, writing the benchmark CSV schema
+  diagnose   dev-A only: decode ablations + membership/null/existence/merge statistics
   selftest   synthetic end-to-end check (CPU, seconds) -- no cache needed
+
+Targets (Run 2 correction; Run 1 used "primary" for both):
+  --target own          a hit's membership is correct on ANY candidate seeded on its own particle
+                        (duplicates are resolved by the merge head), not only the primary seed
+  --exist-target real   existence = "candidate is seeded on a real particle" (spurious -> 0);
+                        duplicates are handled by merge, not by switching them off
+Decoders (--decode): v1 = Run 1 behaviour; v2 = hits go to their best SURVIVING candidate (as
+documented above), at least one group always survives, merges only between candidates that
+share hits' local neighbourhoods (no all-pairs single linkage).
 
 Data protocol (enforced by --batches guards in eval): train on the training split; develop on
 dev-A 0:150; freeze; confirm once on dev-B 150:314; held-out 314:627 only afterwards.
@@ -174,11 +184,15 @@ def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
     bkg_fg = (~pop_fg) & (y_fg < 0)
     target[bkg_fg] = m                                            # null column
     seed_true_d = seed_true.to(dev)
+    # any candidate seeded on the hit's own particle (primary or duplicate)
+    own = (seed_true_d[nb] == y_fg[:, None]) & (pop_fg & (y_fg >= 0))[:, None]
     exist_t = torch.zeros(K, device=dev)
     if primary:
         exist_t[torch.tensor(sorted(primary.values()), dtype=torch.long, device=dev)] = 1.0
+    exist_real = (seed_true_d >= 0).float()
     return {"fg_idx": fg_idx, "ox": ox, "beta": beta, "hit_x": hit_x, "cp": cp, "nb": nb,
             "m": m, "K": K, "D": D, "target": target, "correct": correct, "pop_fg": pop_fg,
+            "own": own, "exist_real": exist_real,
             "seed_true": seed_true_d, "exist_t": exist_t, "hard_labels": lab_fg,
             "y_i": y_i, "y_sem": ysem, "fg": fg, "n_hit": fg.numel(),
             "batch": ev["batch"], "event": ev["event"]}
@@ -198,19 +212,66 @@ def merge_pairs(K, dev, max_pairs=4096):
     return p
 
 
-def event_loss(model, d, w_exist=1.0, w_merge=1.0):
+def candidate_pairs(nb, K, scope, dev, max_pairs=4096):
+    """Candidate pairs for the merge head.
+
+    all:   every pair (random subset above max_pairs) -- Run 1.
+    local: pairs that appear together in some hit's top-M list, i.e. candidates that compete
+           for the same hits. Far pairs can then never be merged.
+    """
+    import torch
+    if scope == "all":
+        return merge_pairs(K, dev, max_pairs)
+    if scope != "local":
+        raise ValueError(f"unknown merge scope {scope!r}")
+    m = nb.size(1)
+    if K < 2 or K > MAX_MERGE_K or m < 2:
+        return torch.zeros(0, 2, dtype=torch.long, device=dev)
+    i, j = torch.triu_indices(m, m, offset=1, device=nb.device)
+    a, b = nb[:, i].reshape(-1), nb[:, j].reshape(-1)
+    key = torch.unique(torch.minimum(a, b) * K + torch.maximum(a, b))
+    p = torch.stack([key // K, key % K], dim=1).to(dev)
+    if p.size(0) > max_pairs:
+        p = p[torch.randperm(p.size(0), device=dev)[:max_pairs]]
+    return p
+
+
+def pair_targets(d, pairs):
+    """1 where both candidates are seeded on the same real particle."""
+    st = d["seed_true"]
+    return ((st[pairs[:, 0]] == st[pairs[:, 1]]) & (st[pairs[:, 0]] >= 0)).float()
+
+
+def membership_loss(lg, d, target):
     import torch
     import torch.nn.functional as F
+    if target == "primary":
+        loss = F.cross_entropy(lg, d["target"], ignore_index=IGNORE)
+        return lg.sum() * 0.0 if torch.isnan(loss) else loss
+    if target != "own":
+        raise ValueError(f"unknown membership target {target!r}")
+    # multi-positive: -log(sum of the probability on the allowed columns)
+    pos = torch.zeros_like(lg, dtype=torch.bool)
+    pos[:, :-1] = d["own"]
+    pos[d["target"] == d["m"], -1] = True                     # background -> null
+    valid = pos.any(dim=1)
+    if not bool(valid.any()):
+        return lg.sum() * 0.0
+    lv = lg[valid]
+    return (lv.logsumexp(dim=1) - lv.masked_fill(~pos[valid], float("-inf")).logsumexp(dim=1)).mean()
+
+
+def event_loss(model, d, w_exist=1.0, w_merge=1.0, target="primary", exist_target="primary",
+               merge_scope="all"):
+    import torch.nn.functional as F
     lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
-    loss_mem = F.cross_entropy(lg, d["target"], ignore_index=IGNORE)
-    if torch.isnan(loss_mem):
-        loss_mem = lg.sum() * 0.0
-    loss_ex = F.binary_cross_entropy_with_logits(e, d["exist_t"])
-    pairs = merge_pairs(d["K"], lg.device)
+    loss_mem = membership_loss(lg, d, target)
+    ex_t = {"primary": d["exist_t"], "real": d["exist_real"]}[exist_target]
+    loss_ex = F.binary_cross_entropy_with_logits(e, ex_t)
+    pairs = candidate_pairs(d["nb"], d["K"], merge_scope, lg.device)
     loss_mg = lg.sum() * 0.0
     if pairs.numel():
-        st = d["seed_true"]
-        tgt = ((st[pairs[:, 0]] == st[pairs[:, 1]]) & (st[pairs[:, 0]] >= 0)).float()
+        tgt = pair_targets(d, pairs)
         w = lg.softmax(dim=1)[:, :-1]
         loss_mg = F.binary_cross_entropy_with_logits(
             model.merge_logits(c, cen, pairs, w, d["nb"]), tgt)
@@ -222,24 +283,35 @@ def event_loss(model, d, w_exist=1.0, w_merge=1.0):
 # --------------------------------------------------------------------------- #
 # inference
 # --------------------------------------------------------------------------- #
-def predict_labels(model, d, merge_thr=0.5, exist_thr=0.5, allow_null=True):
+# decode presets. v1 = Run 1. v2 = the documented decode (best surviving candidate), at least
+# one surviving group, local merges.
+PRESETS = {
+    "v1": dict(merge_thr=0.5, exist_thr=0.5, allow_null=True, merge_scope="all",
+               reassign=False, keep_one=False),
+    "v2": dict(merge_thr=0.5, exist_thr=0.5, allow_null=True, merge_scope="local",
+               reassign=True, keep_one=True),
+}
+
+
+def predict_labels(model, d, merge_thr=0.5, exist_thr=0.5, allow_null=True, merge_scope="all",
+                   reassign=False, keep_one=False, nearest=False):
     """Hard labels over foreground hits (-1 = unassigned) + diagnostics.
 
+    merge_thr / exist_thr None disable merging / existence. reassign: a hit goes to its best
+    candidate whose group survives (else to the best candidate, dropped if its group died).
+    keep_one: if no group survives existence, keep the most confident one. nearest: ignore the
+    learned memberships and take the nearest candidate (reproduces the hard seed decoder).
     Inference only: runs under no_grad, so the returned tensors never carry gradients.
     """
     import torch
     with torch.no_grad():
-        return _predict_labels(model, d, merge_thr, exist_thr, allow_null)
+        return _predict_labels(model, d, merge_thr, exist_thr, allow_null, merge_scope,
+                               reassign, keep_one, nearest)
 
 
-def _predict_labels(model, d, merge_thr, exist_thr, allow_null):
+def _components(K, pairs, dev):
+    """Connected components (union-find, smallest index as root) over accepted pairs."""
     import torch
-    lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
-    w = lg.softmax(dim=1)
-    m, K = d["m"], d["K"]
-    pick = w.argmax(dim=1)
-    top_cand = d["nb"].gather(1, w[:, :m].argmax(dim=1, keepdim=True)).squeeze(1)
-    # merge candidates: connected components over accepted pairs
     parent = list(range(K))
 
     def find(x):
@@ -248,35 +320,238 @@ def _predict_labels(model, d, merge_thr, exist_thr, allow_null):
             x = parent[x]
         return x
 
-    pairs = merge_pairs(K, lg.device, max_pairs=200_000)
-    if pairs.numel():
-        acc = torch.sigmoid(model.merge_logits(c, cen, pairs, w[:, :m], d["nb"])) > merge_thr
-        for a, b in pairs[acc].tolist():
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-    root = torch.tensor([find(k) for k in range(K)], dtype=torch.long, device=lg.device)
-    alive = torch.sigmoid(e) > exist_thr
-    keep = torch.zeros(K, dtype=torch.bool, device=lg.device)
-    for k in range(K):                      # a group survives if any member is alive
-        if alive[k]:
-            keep[root[k]] = True
-    lab = root[top_cand]
-    if allow_null:
-        lab = torch.where(pick == m, torch.full_like(lab, -1), lab)
-    lab = torch.where(keep[lab.clamp(min=0)] | (lab < 0), lab, torch.full_like(lab, -1))
+    for a, b in pairs.tolist():
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    return torch.tensor([find(k) for k in range(K)], dtype=torch.long, device=dev)
+
+
+def _predict_labels(model, d, merge_thr, exist_thr, allow_null, merge_scope, reassign, keep_one,
+                    nearest):
+    import torch
+    lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
+    w = lg.softmax(dim=1)
+    m, K, nb = d["m"], d["K"], d["nb"]
+    dev = lg.device
+    raw_best = w[:, :m].argmax(dim=1, keepdim=True)
+    root = torch.arange(K, device=dev)
+    if merge_thr is not None:
+        pairs = candidate_pairs(nb, K, merge_scope, dev, max_pairs=200_000)
+        if pairs.numel():
+            acc = torch.sigmoid(model.merge_logits(c, cen, pairs, w[:, :m], nb)) > merge_thr
+            root = _components(K, pairs[acc], dev)
+    alive = (torch.ones(K, dtype=torch.bool, device=dev) if exist_thr is None
+             else torch.sigmoid(e) > exist_thr)
+    keep = torch.zeros(K, dtype=torch.bool, device=dev)
+    keep[root[alive]] = True                   # a group survives if any member is alive
+    if keep_one and K > 0 and not bool(keep.any()):
+        keep[root[e.argmax()]] = True
+    score = w[:, :m]
+    if nearest:                                 # nb columns are sorted by distance
+        score = -torch.arange(m, device=dev, dtype=w.dtype).expand(nb.size(0), m)
+    has = torch.ones(nb.size(0), dtype=torch.bool, device=dev)
+    if reassign:
+        ok = keep[root[nb]]
+        score = score.masked_fill(~ok, float("-inf"))
+        has = ok.any(dim=1)
+    best = score.argmax(dim=1, keepdim=True)
+    lab = root[nb.gather(1, best).squeeze(1)]
+    lab = torch.where(has & keep[lab], lab, torch.full_like(lab, -1))
+    if allow_null:                              # null beats the chosen candidate
+        null_wins = w[:, m] > w[:, :m].gather(1, best).squeeze(1)
+        lab = torch.where(null_wins, torch.full_like(lab, -1), lab)
     # renumber to contiguous ids
     out = torch.full_like(lab, -1)
     uniq = torch.unique(lab[lab >= 0])
     for new, old in enumerate(uniq.tolist()):
         out[lab == old] = new
-    diag = {"n_cand": K, "n_groups": int(uniq.numel()),
-            "frac_null": float((pick == m).float().mean()),
-            "pick_correct": float(((d["nb"].gather(1, w[:, :m].argmax(dim=1, keepdim=True)).squeeze(1)
-                                    == d["correct"]) & d["pop_fg"]).sum()),
-            "pop": int(d["pop_fg"].sum()),
-            "oracle_in_nb": float(((d["nb"] == d["correct"][:, None]).any(dim=1) & d["pop_fg"]).sum())}
+    pop = d["pop_fg"]
+    diag = {"n_cand": K, "n_keep": int(keep.sum()), "n_groups": int(uniq.numel()),
+            "frac_null": float((w.argmax(dim=1) == m).float().mean()),
+            "pick_correct": float(((nb.gather(1, raw_best).squeeze(1) == d["correct"]) & pop).sum()),
+            "pop": int(pop.sum()),
+            "oracle_in_nb": float(((nb == d["correct"][:, None]).any(dim=1) & pop).sum())}
+    if "own" in d:
+        diag["pick_own"] = float(d["own"].gather(1, raw_best).squeeze(1).sum())
+        diag["own_in_nb"] = float(d["own"].any(dim=1).sum())
     return out, diag
+
+
+def decode_kwargs(a):
+    """Decode preset from --decode, with the explicit threshold / null flags as overrides."""
+    kw = dict(PRESETS[getattr(a, "decode", "v1")])
+    if getattr(a, "merge_thr", None) is not None:
+        kw["merge_thr"] = a.merge_thr
+    if getattr(a, "exist_thr", None) is not None:
+        kw["exist_thr"] = a.exist_thr
+    if getattr(a, "no_null", False):
+        kw["allow_null"] = False
+    return kw
+
+
+# --------------------------------------------------------------------------- #
+# diagnostics (dev-A only)
+# --------------------------------------------------------------------------- #
+_OFF = dict(merge_thr=None, exist_thr=None, allow_null=False)
+VARIANTS = [                                   # (name, predict_labels kwargs, force dist_only)
+    ("v1", PRESETS["v1"], False),
+    ("v1_nonull", {**PRESETS["v1"], "allow_null": False}, False),
+    ("v1_noexist", {**PRESETS["v1"], "exist_thr": None}, False),
+    ("v1_nomerge", {**PRESETS["v1"], "merge_thr": None}, False),
+    ("v1_localmerge", {**PRESETS["v1"], "merge_scope": "local"}, False),
+    ("v1_reassign", {**PRESETS["v1"], "reassign": True, "keep_one": True}, False),
+    ("v2", PRESETS["v2"], False),
+    ("v2_nonull", {**PRESETS["v2"], "allow_null": False}, False),
+    ("v2_nomerge", {**PRESETS["v2"], "merge_thr": None}, False),
+    ("pick_only", _OFF, False),                # learned membership, nothing else
+    ("pick_only_dist", _OFF, True),            # same weights, pair_net switched off
+    ("nearest", {**_OFF, "nearest": True}, False),   # must equal the hard seed decoder
+]
+
+
+def head_stats(model, d):
+    """Per-event counts for membership, null, existence and merge (summed over events)."""
+    import torch
+    import torch.nn.functional as F
+    with torch.no_grad():
+        lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
+        m, K, nb, own = d["m"], d["K"], d["nb"], d["own"]
+        w = lg.softmax(dim=1)
+        pop, bkg = d["pop_fg"], d["target"] == m
+        best = w[:, :m].argmax(dim=1, keepdim=True)
+        null = w.argmax(dim=1) == m
+        p = torch.sigmoid(e)
+        alive = p > 0.5
+        prim_t, real_t = d["exist_t"], d["exist_real"]
+        s = {"events": 1, "n_fg": int(pop.numel()), "n_pop": int(pop.sum()), "n_bkg": int(bkg.sum()),
+             "prim_local": int(((nb == d["correct"][:, None]).any(dim=1) & pop).sum()),
+             "own_local": int(own.any(dim=1).sum()),
+             "pick_prim": int(((nb.gather(1, best).squeeze(1) == d["correct"]) & pop).sum()),
+             "pick_own": int(own.gather(1, best).squeeze(1).sum()),
+             "near_prim": int(((nb[:, 0] == d["correct"]) & pop).sum()),
+             "near_own": int(own[:, 0].sum()),
+             "null_pop": int((null & pop).sum()), "null_bkg": int((null & bkg).sum()),
+             "K": K, "p_sum": float(p.sum()), "alive": int(alive.sum()),
+             "prim": float(prim_t.sum()), "real": float(real_t.sum()),
+             "alive_prim": int((alive & (prim_t > 0)).sum()),
+             "alive_real": int((alive & (real_t > 0)).sum()),
+             "bce_prim": float(F.binary_cross_entropy_with_logits(e, prim_t, reduction="sum")),
+             "bce_real": float(F.binary_cross_entropy_with_logits(e, real_t, reduction="sum")),
+             "all_dead": int(not bool(alive.any())),
+             "real_particles": int(torch.unique(d["seed_true"][d["seed_true"] >= 0]).numel())}
+        for scope in ("all", "local"):
+            pairs = candidate_pairs(nb, K, scope, lg.device, max_pairs=200_000)
+            s[f"{scope}_pairs"] = int(pairs.size(0))
+            if pairs.numel():
+                tgt = pair_targets(d, pairs)
+                ml = model.merge_logits(c, cen, pairs, w[:, :m], nb)
+                acc = torch.sigmoid(ml) > 0.5
+                s[f"{scope}_pos"] = float(tgt.sum())
+                s[f"{scope}_acc"] = int(acc.sum())
+                s[f"{scope}_acc_pos"] = int((acc & (tgt > 0)).sum())
+                s[f"{scope}_bce"] = float(F.binary_cross_entropy_with_logits(ml, tgt, reduction="sum"))
+                s[f"{scope}_groups"] = int(torch.unique(_components(K, pairs[acc], lg.device)).numel())
+            else:
+                s.update({f"{scope}_pos": 0.0, f"{scope}_acc": 0, f"{scope}_acc_pos": 0,
+                          f"{scope}_bce": 0.0, f"{scope}_groups": K})
+    return s
+
+
+def summarize_stats(s):
+    """Rates from summed head_stats counts; each BCE is paired with its constant-prior value."""
+    def r(a, b):
+        return a / b if b else NAN
+
+    def h(q):
+        return 0.0 if q <= 0 or q >= 1 else -(q * math.log(q) + (1 - q) * math.log(1 - q))
+
+    out = {"events": s["events"],
+           "membership": {
+               "bkg_share_of_fg": r(s["n_bkg"], s["n_fg"]),
+               "primary_in_topM": r(s["prim_local"], s["n_pop"]),
+               "own_in_topM": r(s["own_local"], s["n_pop"]),
+               "learned_pick_primary_of_local": r(s["pick_prim"], s["prim_local"]),
+               "nearest_pick_primary_of_local": r(s["near_prim"], s["prim_local"]),
+               "learned_pick_own_of_local": r(s["pick_own"], s["own_local"]),
+               "nearest_pick_own_of_local": r(s["near_own"], s["own_local"])},
+           "null": {"p_null_given_pop": r(s["null_pop"], s["n_pop"]),
+                    "p_null_given_bkg": r(s["null_bkg"], s["n_bkg"])},
+           "existence": {
+               "cands_per_event": r(s["K"], s["events"]),
+               "primary_rate": r(s["prim"], s["K"]), "real_rate": r(s["real"], s["K"]),
+               "mean_p": r(s["p_sum"], s["K"]), "alive_rate": r(s["alive"], s["K"]),
+               "events_all_dead": r(s["all_dead"], s["events"]),
+               "alive_precision_primary": r(s["alive_prim"], s["alive"]),
+               "alive_recall_primary": r(s["alive_prim"], s["prim"]),
+               "alive_precision_real": r(s["alive_real"], s["alive"]),
+               "alive_recall_real": r(s["alive_real"], s["real"]),
+               "bce_primary": r(s["bce_prim"], s["K"]), "prior_bce_primary": h(r(s["prim"], s["K"])),
+               "bce_real": r(s["bce_real"], s["K"]), "prior_bce_real": h(r(s["real"], s["K"]))},
+           "merge": {"real_particles_per_event": r(s["real_particles"], s["events"])}}
+    for scope in ("all", "local"):
+        n = s[f"{scope}_pairs"]
+        out["merge"][scope] = {
+            "pairs_per_event": r(n, s["events"]), "pos_rate": r(s[f"{scope}_pos"], n),
+            "accept_rate": r(s[f"{scope}_acc"], n),
+            "precision": r(s[f"{scope}_acc_pos"], s[f"{scope}_acc"]),
+            "recall": r(s[f"{scope}_acc_pos"], s[f"{scope}_pos"]),
+            "bce": r(s[f"{scope}_bce"], n), "prior_bce": h(r(s[f"{scope}_pos"], n)),
+            "groups_per_event_after_merge": r(s[f"{scope}_groups"], s["events"])}
+    return out
+
+
+def diagnose_event(model, d, variants=None):
+    """One row per decode variant for this event, each paired with the hard seed decoder."""
+    import torch
+    keep = d["fg"] & (d["y_sem"] >= 0)
+    mp = keep & (d["y_i"] >= 0)
+    hard = torch.full((d["n_hit"],), -1, dtype=torch.long)
+    hard[d["fg_idx"]] = d["hard_labels"].cpu()
+    qh = mb.event_quality(hard, d["y_i"], d["y_sem"], keep)
+    base = {"batch": d["batch"], "event": d["event"], "n_fg": int(d["fg_idx"].numel()),
+            "beta_max": float(d["beta"].max()), "K": d["K"],
+            "ari_hardseed": qh.get("ari_particle", NAN), "n_pred_hardseed": qh.get("n_pred", NAN)}
+    rows, trained = [], model.dist_only
+    try:
+        for name, kw, dist in (variants or VARIANTS):
+            model.dist_only = trained or dist
+            lab_fg, diag = predict_labels(model, d, **kw)
+            lab = torch.full((d["n_hit"],), -1, dtype=torch.long)
+            lab[d["fg_idx"]] = lab_fg.cpu()
+            q = mb.event_quality(lab, d["y_i"], d["y_sem"], keep)
+            rows.append({**base, "variant": name, "ari_particle": q.get("ari_particle", NAN),
+                         "n_pred": q.get("n_pred", NAN), "n_true": q.get("n_true", NAN),
+                         "n_groups": diag["n_groups"], "n_keep": diag["n_keep"],
+                         "pop_unassigned": (float((lab[mp] < 0).float().mean())
+                                            if bool(mp.any()) else NAN)})
+    finally:
+        model.dist_only = trained
+    return rows
+
+
+def summarize_variants(rows):
+    import numpy as np
+    out = {}
+    for name in dict.fromkeys(r["variant"] for r in rows):
+        rr = [r for r in rows if r["variant"] == name]
+        g = lambda c: np.array([float(r[c]) for r in rr], dtype=float)
+        ari, hs, npred, ntrue = g("ari_particle"), g("ari_hardseed"), g("n_pred"), g("n_true")
+        ok = np.isfinite(ari) & np.isfinite(hs)
+        dl = ari[ok] - hs[ok]
+        groups, nkeep = g("n_groups"), g("n_keep")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = npred / ntrue
+        out[name] = {"ari_particle": float(np.nanmean(ari)), "ari_hardseed": float(np.nanmean(hs)),
+                     "delta": float(dl.mean()) if dl.size else NAN,
+                     "delta_se": float(dl.std(ddof=1) / np.sqrt(dl.size)) if dl.size > 1 else NAN,
+                     "pred_true_med": float(np.nanmedian(ratio)),
+                     "groups_med": float(np.nanmedian(groups)),
+                     "no_cluster": float(np.mean(groups == 0)),
+                     "no_cluster_all_dead": float(np.mean((groups == 0) & (nkeep == 0))),
+                     "pop_unassigned": float(np.nanmean(g("pop_unassigned"))),
+                     "n_events": int(ok.sum())}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -326,15 +601,27 @@ def cmd_train(a):
     gb = sum(v.numel() * v.element_size() for d in train for v in d.values()
              if hasattr(v, "numel")) / 1e9
     print(f"  cached training tensors: {gb:.2f} GB (CPU)", flush=True)
+    model.dist_only = a.dist_only
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
-    hist = []
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    (out / "epochs").mkdir(exist_ok=True)
+    cfg = {"rule": a.rule, "m": a.m, "r": a.r, "width": a.width, "lr": a.lr, "epochs": a.epochs,
+           "w_exist": a.w_exist, "w_merge": a.w_merge, "seed": a.seed, "t_d": a.t_d,
+           "t_assign": a.t_assign, "hit_dim": train[0]["hit_x"].size(1),
+           "lat_dim": train[0]["ox"].size(1), "accum": a.accum, "max_merge_k": MAX_MERGE_K,
+           "train_cache": a.train_cache, "train_batches": a.train_batches,
+           "n_train_events": len(train), "target": a.target, "exist_target": a.exist_target,
+           "merge_scope": a.merge_scope, "dist_only": a.dist_only, "decode": a.decode,
+           "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above"}
+    hist, best, best_epoch = [], -math.inf, None
     for epoch in range(a.epochs):
         model.train()
         perm = torch.randperm(len(train))
         tot, parts, n = 0.0, {"mem": 0.0, "exist": 0.0, "merge": 0.0}, 0
         opt.zero_grad()
         for j, i in enumerate(perm.tolist()):
-            loss, p = event_loss(model, to_device(train[i], dev), a.w_exist, a.w_merge)
+            loss, p = event_loss(model, to_device(train[i], dev), a.w_exist, a.w_merge,
+                                 a.target, a.exist_target, a.merge_scope)
             (loss / a.accum).backward()
             tot += float(loss.detach()); n += 1
             for k in p: parts[k] += p[k]
@@ -345,21 +632,25 @@ def cmd_train(a):
         row = {"epoch": epoch, "loss": tot / n, **{k: v / n for k, v in parts.items()}}
         if a.dev_cache:
             row.update(evaluate(model, a, mat, rule_fn, dev, a.dev_cache, a.dev_batches,
-                                out=None, tag=f"dev_epoch{epoch}"))
+                                out=None, tag="dev"))
         hist.append(row)
         print("  " + "  ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}"
                                for k, v in row.items()), flush=True)
-    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    cfg = {"rule": a.rule, "m": a.m, "r": a.r, "width": a.width, "lr": a.lr, "epochs": a.epochs,
-           "w_exist": a.w_exist, "w_merge": a.w_merge, "seed": a.seed, "t_d": a.t_d,
-           "t_assign": a.t_assign, "hit_dim": train[0]["hit_x"].size(1),
-           "lat_dim": train[0]["ox"].size(1), "accum": a.accum, "max_merge_k": MAX_MERGE_K,
-           "train_cache": a.train_cache, "train_batches": a.train_batches,
-           "n_train_events": len(train)}
-    torch.save({"state_dict": model.state_dict(), "cfg": cfg}, out / "head.pt")
-    mb.write_rows(out / "train_history.csv", hist)
+        state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        torch.save({"state_dict": state, "cfg": {**cfg, "epoch": epoch}},
+                   out / "epochs" / f"head_ep{epoch}.pt")
+        score = row.get("dev/ari_particle", NAN)
+        if a.dev_cache and math.isfinite(score) and score > best:
+            best, best_epoch = score, epoch
+            torch.save({"state_dict": state, "cfg": {**cfg, "epoch": epoch}}, out / "head_best.pt")
+        mb.write_rows(out / "train_history.csv", hist)
+    cfg.update({"best_epoch": best_epoch, "best_dev_ari": best if best_epoch is not None else NAN})
+    # head.pt = LAST epoch (as in Run 1); head_best.pt = best dev-A epoch under the decode above
+    torch.save({"state_dict": model.state_dict(), "cfg": {**cfg, "epoch": a.epochs - 1}},
+               out / "head.pt")
     (out / "train_meta.json").write_text(json.dumps({**cfg, **_prov(mat)}, indent=2))
-    print(f"wrote {out}/head.pt")
+    print(f"wrote {out}/head.pt (last epoch) and head_best.pt (dev-A epoch {best_epoch}, "
+          f"ari_particle {best:.4f})")
 
 
 def evaluate(model, a, mat, rule_fn, dev, cache, batches, out, tag):
@@ -369,7 +660,7 @@ def evaluate(model, a, mat, rule_fn, dev, cache, batches, out, tag):
     rows = []
     with torch.no_grad():
         for d in iter_events(cache, *mb.parse_range(batches), mat, rule_fn, a, dev):
-            lab_fg, diag = predict_labels(model, d, a.merge_thr, a.exist_thr, not a.no_null)
+            lab_fg, diag = predict_labels(model, d, **decode_kwargs(a))
             lab = torch.full((d["n_hit"],), -1, dtype=torch.long)
             lab[d["fg_idx"]] = lab_fg.cpu()
             keep = d["fg"] & (d["y_sem"] >= 0)
@@ -383,6 +674,8 @@ def evaluate(model, a, mat, rule_fn, dev, cache, batches, out, tag):
                                                        "completeness", "n_pred", "noise_frac")},
                          "ari_particle_hardseed": qh.get("ari_particle", NAN),
                          "n_pred_hardseed": qh.get("n_pred", NAN), **diag})
+            mp = keep & (d["y_i"] >= 0)
+            rows[-1]["pop_unassigned"] = float((lab[mp] < 0).float().mean()) if bool(mp.any()) else NAN
     g = lambda c: np.array([float(r.get(c, NAN)) for r in rows], dtype=float)
     pop, corr, orc = g("pop").sum(), g("pick_correct").sum(), g("oracle_in_nb").sum()
     summary = {f"{tag}/ari_particle": float(np.nanmean(g("ari_particle"))),
@@ -392,6 +685,8 @@ def evaluate(model, a, mat, rule_fn, dev, cache, batches, out, tag):
                f"{tag}/null_frac": float(np.nanmean(g("frac_null"))),
                f"{tag}/pick_acc": float(corr / max(pop, 1)),
                f"{tag}/pick_acc_of_local": float(corr / max(orc, 1)),
+               f"{tag}/pick_own_of_local": float(g("pick_own").sum() / max(g("own_in_nb").sum(), 1)),
+               f"{tag}/pop_unassigned": float(np.nanmean(g("pop_unassigned"))),
                f"{tag}/no_cluster": float(np.mean(g("n_groups") == 0))}
     if out:
         Path(out).mkdir(parents=True, exist_ok=True)
@@ -418,9 +713,53 @@ def cmd_eval(a):
     if (hi is None or hi > a.heldout_start) and not a.allow_heldout:
         raise SystemExit(f"--batches {a.batches} reaches the held-out set; use a development "
                          "split or pass --allow-heldout")
+    model = load_head(ck, dev)
+    evaluate(model, a, mat, s0.make_rule(cfg["rule"]), dev, a.cache, a.batches, a.out, a.tag)
+
+
+def load_head(ck, dev):
+    cfg = ck["cfg"]
     model = build_model(cfg["hit_dim"], cfg["lat_dim"], cfg["width"], cfg["r"]).to(dev)
     model.load_state_dict(ck["state_dict"])
-    evaluate(model, a, mat, s0.make_rule(cfg["rule"]), dev, a.cache, a.batches, a.out, a.tag)
+    model.dist_only = bool(cfg.get("dist_only", False))
+    model.eval()
+    return model
+
+
+def cmd_diagnose(a):
+    """Decode ablations + head statistics for one trained head, on dev-A only."""
+    import torch
+    lo, hi = mb.parse_range(a.batches)
+    if hi is None or hi > a.deva_end:
+        raise SystemExit(f"diagnose is dev-A only (batches < {a.deva_end}); got {a.batches}")
+    mat, dev = _setup(a)
+    ck = torch.load(a.head, map_location=dev, weights_only=False)
+    cfg = ck["cfg"]
+    for k in ("rule", "m", "r", "t_d", "t_assign"):
+        setattr(a, k, cfg[k])
+    model = load_head(ck, dev)
+    stats, rows = {}, []
+    t0 = time.perf_counter()
+    for d in iter_events(a.cache, lo, hi, mat, s0.make_rule(cfg["rule"]), a, dev):
+        for k, v in head_stats(model, d).items():
+            stats[k] = stats.get(k, 0) + v
+        rows += diagnose_event(model, d)
+    if not rows:
+        raise SystemExit("no usable events")
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    mb.write_rows(out / "diagnose_events.csv", rows)
+    res = {"head": str(a.head), "head_epoch": cfg.get("epoch"), "batches": a.batches,
+           "variants": summarize_variants(rows), "heads": summarize_stats(stats),
+           "wall_s": time.perf_counter() - t0}
+    (out / "diagnose_summary.json").write_text(json.dumps(res, indent=2))
+    print(f"{'variant':16s} {'ARI':>7s} {'d_vs_hard':>10s} {'+-SE':>7s} {'pred/true':>9s} "
+          f"{'groups':>6s} {'no_cl':>6s} {'dead':>6s} {'pop_-1':>7s}")
+    for name, v in res["variants"].items():
+        print(f"{name:16s} {v['ari_particle']:7.4f} {v['delta']:+10.4f} {v['delta_se']:7.4f} "
+              f"{v['pred_true_med']:9.2f} {v['groups_med']:6.1f} {v['no_cluster']:6.3f} "
+              f"{v['no_cluster_all_dead']:6.3f} {v['pop_unassigned']:7.3f}")
+    print(json.dumps(res["heads"], indent=2))
+    print(f"wrote {out}/diagnose_summary.json")
 
 
 def cmd_selftest(a):
@@ -507,8 +846,10 @@ def main():
         s.add_argument("--r", type=int, default=2)
         s.add_argument("--t-d", type=float, default=0.3)
         s.add_argument("--t-assign", type=float, default=float("inf"))
-        s.add_argument("--merge-thr", type=float, default=0.5)
-        s.add_argument("--exist-thr", type=float, default=0.5)
+        s.add_argument("--decode", choices=sorted(PRESETS), default="v2",
+                       help="decode preset (v1 = Run 1); the flags below override it")
+        s.add_argument("--merge-thr", type=float, default=None)
+        s.add_argument("--exist-thr", type=float, default=None)
         s.add_argument("--no-null", action="store_true",
                        help="never predict the null option at inference")
 
@@ -525,6 +866,11 @@ def main():
     s.add_argument("--w-exist", type=float, default=1.0)
     s.add_argument("--w-merge", type=float, default=1.0)
     s.add_argument("--seed", type=int, default=1)
+    s.add_argument("--target", choices=["own", "primary"], default="own")
+    s.add_argument("--exist-target", choices=["real", "primary"], default="real")
+    s.add_argument("--merge-scope", choices=["local", "all"], default="local")
+    s.add_argument("--dist-only", action="store_true",
+                   help="ablation: membership from latent distance + existence only (no pair_net)")
     s.set_defaults(fn=cmd_train)
 
     s = sub.add_parser("eval"); common(s)
@@ -536,6 +882,14 @@ def main():
     s.add_argument("--heldout-start", type=int, default=314)
     s.add_argument("--allow-heldout", action="store_true")
     s.set_defaults(fn=cmd_eval)
+
+    s = sub.add_parser("diagnose"); common(s)
+    s.add_argument("--head", required=True)
+    s.add_argument("--cache", required=True)
+    s.add_argument("--batches", default="0:150")
+    s.add_argument("--out", required=True)
+    s.add_argument("--deva-end", type=int, default=150)
+    s.set_defaults(fn=cmd_diagnose)
 
     s = sub.add_parser("selftest"); common(s)
     s.set_defaults(fn=cmd_selftest, device="cpu")
