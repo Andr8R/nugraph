@@ -404,6 +404,8 @@ VARIANTS = [                                   # (name, predict_labels kwargs, f
     ("v2", PRESETS["v2"], False),
     ("v2_nonull", {**PRESETS["v2"], "allow_null": False}, False),
     ("v2_nomerge", {**PRESETS["v2"], "merge_thr": None}, False),
+    ("v2_nonull_nomerge", {**PRESETS["v2"], "allow_null": False, "merge_thr": None}, False),
+    ("pick_merge", {**PRESETS["v2"], "allow_null": False, "exist_thr": None}, False),  # pick + merge only
     ("pick_only", _OFF, False),                # learned membership, nothing else
     ("pick_only_dist", _OFF, True),            # same weights, pair_net switched off
     ("nearest", {**_OFF, "nearest": True}, False),   # must equal the hard seed decoder
