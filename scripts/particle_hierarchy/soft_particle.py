@@ -93,6 +93,7 @@ def build_model(hit_dim, lat_dim, width, R, cfg=None):
                                            nn.Linear(width, 1))
             self.log_temp = nn.Parameter(torch.zeros(1))
             self.dist_only = False        # ablation switch
+            self.overlap = "dense"        # merge overlap Σ_i w_ia·w_ib: "dense" (Stage 1a) | "sparse"
 
         def logits(self, h, c, ox, cen, nb, e):
             """Membership logits (n_hit, M+1): last column is the null option."""
@@ -138,14 +139,56 @@ def build_model(hit_dim, lat_dim, width, R, cfg=None):
             d = cen[a] - cen[b]
             ov = torch.zeros(pairs.size(0), 1, device=c.device)
             if w is not None and nb is not None:
-                full = torch.zeros(w.size(0), c.size(0), device=c.device)
-                full.scatter_(1, nb, w)
-                ov = (full[:, a] * full[:, b]).sum(0).unsqueeze(-1)
+                if self.overlap == "sparse":
+                    ov = sparse_overlap(w, nb, pairs, c.size(0)).unsqueeze(-1)
+                else:
+                    full = torch.zeros(w.size(0), c.size(0), device=c.device)
+                    full.scatter_(1, nb, w)
+                    ov = (full[:, a] * full[:, b]).sum(0).unsqueeze(-1)
             feat = torch.cat([c[a] + c[b], (c[a] - c[b]).abs(), d.abs(),
                               d.norm(dim=-1, keepdim=True), ov], dim=-1)
             return self.merge_net(feat).squeeze(-1)
 
     return Model()
+
+
+def sparse_overlap(w, nb, pairs, K):
+    """Σ_i w_ia·w_ib for candidate pairs, from each hit's M candidates only.
+
+    Same quantity as the dense (n_hit x K) formula, since w_i is zero outside hit i's top-M,
+    but memory O(n_hit·M²) instead of O(n_hit·pairs). Differentiable in w.
+    """
+    import torch
+    m = nb.size(1)
+    zero = torch.zeros(pairs.size(0), dtype=w.dtype, device=w.device)
+    if m < 2 or pairs.numel() == 0:
+        return zero
+    i, j = torch.triu_indices(m, m, offset=1, device=nb.device)
+    a, b = nb[:, i], nb[:, j]
+    key = (torch.minimum(a, b) * K + torch.maximum(a, b)).reshape(-1)
+    uk, inv = torch.unique(key, return_inverse=True)
+    sums = torch.zeros(uk.numel(), dtype=w.dtype, device=w.device).index_add(
+        0, inv, (w[:, i] * w[:, j]).reshape(-1))
+    q = torch.minimum(pairs[:, 0], pairs[:, 1]) * K + torch.maximum(pairs[:, 0], pairs[:, 1])
+    pos = torch.searchsorted(uk, q).clamp(max=uk.numel() - 1)
+    return torch.where(uk[pos] == q, sums[pos], zero)
+
+
+def primary_lookup(primary, y, dev):
+    """correct[i] = primary candidate of hit i's particle, -1 if none (vectorised dict lookup)."""
+    import torch
+    out = torch.full((y.numel(),), -1, dtype=torch.long, device=dev)
+    if not primary or y.numel() == 0:
+        return out
+    ids = torch.tensor(list(primary.keys()), dtype=torch.long, device=dev)
+    vals = torch.tensor(list(primary.values()), dtype=torch.long, device=dev)
+    order = ids.argsort()
+    ids, vals = ids[order], vals[order]
+    yy = y.to(dev).long()
+    pos = torch.searchsorted(ids, yy).clamp(max=ids.numel() - 1)
+    hit = ids[pos] == yy
+    out[hit] = vals[pos][hit]
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -199,8 +242,7 @@ def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
     # ---- targets from truth (train/eval diagnostics only) ----
     seed_true, primary = s0._seed_truth(fg_idx, cp, y_i, ev["beta"])
     y_fg = y_i[fg_idx].to(dev)
-    correct = torch.tensor([primary.get(int(t), -1) for t in y_fg.tolist()],
-                           dtype=torch.long, device=dev)
+    correct = primary_lookup(primary, y_fg, dev)
     pop_fg = pop[fg_idx].to(dev)
     in_nb = (nb == correct[:, None])
     target = torch.full((fg_idx.numel(),), IGNORE, dtype=torch.long, device=dev)
@@ -287,6 +329,14 @@ def membership_loss(lg, d, target):
 
 def event_loss(model, d, w_exist=1.0, w_merge=1.0, target="primary", exist_target="primary",
                merge_scope="all"):
+    loss_mem, loss_ex, loss_mg = event_loss_terms(model, d, target, exist_target, merge_scope)
+    total = loss_mem + w_exist * loss_ex + w_merge * loss_mg
+    return total, {"mem": float(loss_mem.detach()), "exist": float(loss_ex.detach()),
+                   "merge": float(loss_mg.detach())}
+
+
+def event_loss_terms(model, d, target="primary", exist_target="primary", merge_scope="all"):
+    """(membership, existence, merge) losses of one event as tensors."""
     import torch.nn.functional as F
     lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
     loss_mem = membership_loss(lg, d, target)
@@ -299,9 +349,7 @@ def event_loss(model, d, w_exist=1.0, w_merge=1.0, target="primary", exist_targe
         w = lg.softmax(dim=1)[:, :-1]
         loss_mg = F.binary_cross_entropy_with_logits(
             model.merge_logits(c, cen, pairs, w, d["nb"]), tgt)
-    total = loss_mem + w_exist * loss_ex + w_merge * loss_mg
-    return total, {"mem": float(loss_mem.detach()), "exist": float(loss_ex.detach()),
-                   "merge": float(loss_mg.detach())}
+    return loss_mem, loss_ex, loss_mg
 
 
 # --------------------------------------------------------------------------- #
@@ -775,6 +823,7 @@ def load_head(ck, dev):
     model = build_model(cfg["hit_dim"], cfg["lat_dim"], cfg["width"], cfg["r"]).to(dev)
     model.load_state_dict(ck["state_dict"])
     model.dist_only = bool(cfg.get("dist_only", False))
+    model.overlap = cfg.get("overlap", "dense")
     model.eval()
     return model
 

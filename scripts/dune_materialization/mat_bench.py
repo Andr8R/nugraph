@@ -181,6 +181,8 @@ def cmd_cache(a):
     bfile = open(out / "batches.csv", "w", newline="")
     bw = csv.writer(bfile)
     bw.writerow(["batch", "n_graphs", "n_hits", "nugraph_ari", "forward_s"])
+    # every scalar NuGraph metric of the forward pass, per batch (trunk-health metrics)
+    mfile = open(out / "batch_metrics.jsonl", "w")
     shard, shard_id, t_all = [], 0, time.perf_counter()
     torch.cuda.reset_peak_memory_stats(dev)
     n_events = 0
@@ -219,6 +221,13 @@ def cmd_cache(a):
             n_events += 1
         bw.writerow([bi, data.num_graphs, h.num_nodes,
                      float(metrics["instance/adjusted-rand-test"]), f"{t_fwd:.6f}"])
+        scal = {}
+        for k, v in metrics.items():
+            try:
+                scal[k] = float(v)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        mfile.write(json.dumps({"batch": bi, "n_graphs": data.num_graphs, **scal}) + "\n")
         if len(shard) >= a.shard_events:
             torch.save(shard, out / f"shard_{shard_id:04d}.pt")
             shard, shard_id = [], shard_id + 1
@@ -232,6 +241,7 @@ def cmd_cache(a):
     if shard:
         torch.save(shard, out / f"shard_{shard_id:04d}.pt")
     bfile.close()
+    mfile.close()
     manifest.update(finished=time.strftime("%Y-%m-%dT%H:%M:%S"), n_events=n_events,
                     wall_s=round(time.perf_counter() - t_all, 1),
                     forward_peak_alloc_gb=round(torch.cuda.max_memory_allocated(dev) / 1e9, 3))
