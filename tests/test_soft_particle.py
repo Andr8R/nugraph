@@ -295,3 +295,76 @@ def test_perfect_features_are_learnable_end_to_end(cfg):
         full[d["fg_idx"]] = lab
         q = sp.mb.event_quality(full, d["y_i"], d["y_sem"], d["fg"] & (d["y_sem"] >= 0))
     assert q["ari_particle"] > 0.8
+
+
+# --------------------------------------------------------------------------- #
+# timing path (inference only) must be the evaluated path
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("preset", ["v1", "v2"])
+def test_infer_path_matches_evaluated_path(preset):
+    ev = make_event(sep=1.5, std=0.5)                                       # ambiguous event
+    ev["ox"][5] = ev["ox"][0] + torch.nn.functional.one_hot(torch.tensor(1), 8).float()
+    ev["beta"][5] = 0.8                                                     # plus a duplicate seed
+    d = prep(ev)
+    model = sp.build_model(d["hit_x"].size(1), 8, 16, 2)
+    model.eval()
+    kw = {**sp.PRESETS[preset], "allow_null": False}
+    ref, _ = sp.predict_labels(model, d, **kw)
+    x = sp.infer_inputs(ev, mat, sp.s0.make_rule("fixed1:0.5"), 3, 0.3, float("inf"), DEV)
+    assert x["K"] == d["K"] and torch.equal(x["nb"], d["nb"])
+    assert torch.equal(sp.infer_labels(model, x, **kw), ref)
+
+
+def test_infer_marks_every_stage_in_order():
+    ev = make_event()
+    model = sp.build_model(3, 8, 16, 2)
+    names = []
+    x = sp.infer_inputs(ev, mat, sp.s0.make_rule("fixed1:0.5"), 3, 0.3, float("inf"), DEV,
+                        mark=names.append)
+    sp.infer_labels(model, x, mark=names.append, **sp.PRESETS["v2"])
+    assert names == ["candidates", "topm", "forward", "merge", "decode"]
+
+
+def _write_cache_and_head(tmp_path, n_events=4):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    evs = []
+    for i in range(n_events):
+        ev = make_event(seed=i)
+        ev["event"] = i
+        evs.append(ev)
+    torch.save(evs, cache / "shard_00000.pt")
+    model = sp.build_model(3, 8, 16, 2)
+    cfg = {"rule": "fixed1:0.5", "m": 3, "r": 2, "t_d": 0.3, "t_assign": float("inf"),
+           "hit_dim": 3, "lat_dim": 8, "width": 16, "epoch": 0}
+    head = tmp_path / "head.pt"
+    torch.save({"state_dict": model.state_dict(), "cfg": cfg}, head)
+    return cache, head
+
+
+def test_time_command_runs_and_validates_labels(tmp_path, monkeypatch):
+    import json
+    import sys
+    cache, head = _write_cache_and_head(tmp_path)
+    out = tmp_path / "timing"
+    monkeypatch.setattr(sys, "argv", ["soft_particle.py", "time", "--head", str(head),
+                                      "--cache", str(cache), "--batches", "0:1", "--out", str(out),
+                                      "--device", "cpu", "--warmup", "1", "--decode", "v2",
+                                      "--no-null", "--merge-thr", "0.5"])
+    sp.main()
+    res = json.loads((out / "timing_summary.json").read_text())
+    assert res["events_timed"] == 3 and res["warmup_events"] == 1
+    assert res["labels_mismatch"] == 0
+    assert set(res["methods"]) == {"decoder", "hard_seed", "seed_backend", "dbscan"}
+    assert res["methods"]["decoder"]["total_s"] > 0
+    assert set(res["decoder_breakdown"]) == {"candidates", "topm", "forward", "merge", "decode"}
+
+
+def test_time_command_refuses_beyond_dev_a(tmp_path, monkeypatch):
+    import sys
+    cache, head = _write_cache_and_head(tmp_path, 1)
+    monkeypatch.setattr(sys, "argv", ["soft_particle.py", "time", "--head", str(head), "--cache",
+                                      str(cache), "--batches", "150:314", "--out",
+                                      str(tmp_path / "t"), "--device", "cpu"])
+    with pytest.raises(SystemExit):
+        sp.main()

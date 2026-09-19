@@ -18,6 +18,9 @@ Per event:
   train      train on a TRAIN-split cache, monitor on dev-A (saves last, best-on-dev-A, per epoch)
   eval       evaluate a trained head on a cache range, writing the benchmark CSV schema
   diagnose   dev-A only: decode ablations + membership/null/existence/merge statistics
+  time       dev-A only: solo timing of the inference path (no truth work), beside the hard
+             seed decoder, the Thread-A seed backend and canonical DBSCAN on the same events;
+             checks that the timed labels equal the evaluated labels on every event
   selftest   synthetic end-to-end check (CPU, seconds) -- no cache needed
 
 Targets (Run 2 correction; Run 1 used "primary" for both):
@@ -148,10 +151,13 @@ def build_model(hit_dim, lat_dim, width, R, cfg=None):
 # --------------------------------------------------------------------------- #
 # per-event preparation (frozen candidates + targets)
 # --------------------------------------------------------------------------- #
-def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
-    """Return a dict of tensors for one cached event, or None if unusable."""
+def infer_inputs(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True, mark=None):
+    """Inference-only inputs for one event (no truth): foreground, frozen candidates, top-M.
+
+    Returns None if the event is unusable. `mark(name)` is called after each stage (timing).
+    """
     import torch
-    fg, pop, y_i, ysem = s0.event_truth(ev)
+    fg = ev["mask"].bool()
     fg_idx = fg.nonzero(as_tuple=False).squeeze(1)
     if fg_idx.numel() == 0:
         return None
@@ -161,6 +167,8 @@ def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
     cp, lab_fg, D = s0.seeds_and_labels(mat, ox, beta, tau, t_d, t_assign, dev)
     if cp.numel() == 0 or D is None:
         return None
+    if mark:
+        mark("candidates")
     hit_x = None
     if need_hit_x:
         if "hit_x_fg" not in ev:
@@ -171,6 +179,22 @@ def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
     K = cp.numel()
     m = min(M, K)
     nb = torch.topk(D, m, dim=1, largest=False).indices           # (n_fg, m)
+    if mark:
+        mark("topm")
+    return {"fg": fg, "fg_idx": fg_idx, "ox": ox, "beta": beta, "hit_x": hit_x, "cp": cp,
+            "lab_fg": lab_fg, "D": D, "K": K, "m": m, "nb": nb}
+
+
+def prepare(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x=True):
+    """Return a dict of tensors for one cached event (inference inputs + truth targets),
+    or None if unusable."""
+    import torch
+    fg, pop, y_i, ysem = s0.event_truth(ev)
+    x = infer_inputs(ev, mat, rule_fn, M, t_d, t_assign, dev, need_hit_x)
+    if x is None:
+        return None
+    fg_idx, ox, beta, hit_x, cp = x["fg_idx"], x["ox"], x["beta"], x["hit_x"], x["cp"]
+    lab_fg, D, K, m, nb = x["lab_fg"], x["D"], x["K"], x["m"], x["nb"]
 
     # ---- targets from truth (train/eval diagnostics only) ----
     seed_true, primary = s0._seed_truth(fg_idx, cp, y_i, ev["beta"])
@@ -329,8 +353,29 @@ def _components(K, pairs, dev):
 
 def _predict_labels(model, d, merge_thr, exist_thr, allow_null, merge_scope, reassign, keep_one,
                     nearest):
+    out, x = _decode(model, d, merge_thr, exist_thr, allow_null, merge_scope, reassign, keep_one,
+                     nearest)
+    m, K, nb, w, raw_best = d["m"], d["K"], d["nb"], x["w"], x["raw_best"]
+    pop = d["pop_fg"]
+    diag = {"n_cand": K, "n_keep": x["n_keep"], "n_groups": x["n_groups"],
+            "frac_null": float((w.argmax(dim=1) == m).float().mean()),
+            "pick_correct": float(((nb.gather(1, raw_best).squeeze(1) == d["correct"]) & pop).sum()),
+            "pop": int(pop.sum()),
+            "oracle_in_nb": float(((nb == d["correct"][:, None]).any(dim=1) & pop).sum())}
+    if "own" in d:
+        diag["pick_own"] = float(d["own"].gather(1, raw_best).squeeze(1).sum())
+        diag["own_in_nb"] = float(d["own"].any(dim=1).sum())
+    return out, diag
+
+
+def _decode(model, d, merge_thr, exist_thr, allow_null, merge_scope, reassign, keep_one, nearest,
+            mark=None):
+    """Hard labels from inference inputs only (no truth). `mark(name)` is called after the
+    forward pass, after merging and at the end (timing)."""
     import torch
     lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
+    if mark:
+        mark("forward")
     w = lg.softmax(dim=1)
     m, K, nb = d["m"], d["K"], d["nb"]
     dev = lg.device
@@ -341,6 +386,8 @@ def _predict_labels(model, d, merge_thr, exist_thr, allow_null, merge_scope, rea
         if pairs.numel():
             acc = torch.sigmoid(model.merge_logits(c, cen, pairs, w[:, :m], nb)) > merge_thr
             root = _components(K, pairs[acc], dev)
+    if mark:
+        mark("merge")
     alive = (torch.ones(K, dtype=torch.bool, device=dev) if exist_thr is None
              else torch.sigmoid(e) > exist_thr)
     keep = torch.zeros(K, dtype=torch.bool, device=dev)
@@ -366,16 +413,20 @@ def _predict_labels(model, d, merge_thr, exist_thr, allow_null, merge_scope, rea
     uniq = torch.unique(lab[lab >= 0])
     for new, old in enumerate(uniq.tolist()):
         out[lab == old] = new
-    pop = d["pop_fg"]
-    diag = {"n_cand": K, "n_keep": int(keep.sum()), "n_groups": int(uniq.numel()),
-            "frac_null": float((w.argmax(dim=1) == m).float().mean()),
-            "pick_correct": float(((nb.gather(1, raw_best).squeeze(1) == d["correct"]) & pop).sum()),
-            "pop": int(pop.sum()),
-            "oracle_in_nb": float(((nb == d["correct"][:, None]).any(dim=1) & pop).sum())}
-    if "own" in d:
-        diag["pick_own"] = float(d["own"].gather(1, raw_best).squeeze(1).sum())
-        diag["own_in_nb"] = float(d["own"].any(dim=1).sum())
-    return out, diag
+    if mark:
+        mark("decode")
+    return out, {"w": w, "raw_best": raw_best, "n_keep": int(keep.sum()),
+                 "n_groups": int(uniq.numel())}
+
+
+def infer_labels(model, d, mark=None, **decode_kw):
+    """Inference-only hard labels over foreground hits (the timed path)."""
+    import torch
+    kw = dict(merge_thr=0.5, exist_thr=0.5, allow_null=True, merge_scope="all", reassign=False,
+              keep_one=False, nearest=False)
+    kw.update(decode_kw)
+    with torch.no_grad():
+        return _decode(model, d, mark=mark, **kw)[0]
 
 
 def decode_kwargs(a):
@@ -764,6 +815,170 @@ def cmd_diagnose(a):
     print(f"wrote {out}/diagnose_summary.json")
 
 
+def cmd_time(a):
+    """Solo timing of a trained head's inference path on dev-A.
+
+    Timing boundary as in mat_bench.py bench: the event's tensors are on the device before the
+    clock starts; the clock stops after a device synchronize, before labels are copied back.
+    Timed per event: (1) the decoder end to end (foreground, frozen candidates, top-M, head
+    forward, decode); (2) the same with a synchronize after each stage (breakdown only; the
+    extra syncs make it slightly slower); (3) the hard seed decoder on the same candidates;
+    (4) the Thread-A seed backend; (5) canonical DBSCAN. Untimed: the labels of (1) are
+    compared with the evaluated path (prepare + predict_labels) on every event.
+    """
+    import os
+    import numpy as np
+    import torch
+    lo, hi = mb.parse_range(a.batches)
+    if hi is None or hi > a.deva_end:
+        raise SystemExit(f"time is dev-A only (batches < {a.deva_end}); got {a.batches}")
+    mat, dev = _setup(a)
+    cuda = dev.type == "cuda"
+    if cuda:
+        torch.cuda.set_device(dev)
+    sync = (lambda: torch.cuda.synchronize(dev)) if cuda else (lambda: None)
+    ck = torch.load(a.head, map_location=dev, weights_only=False)
+    cfg = ck["cfg"]
+    for k in ("rule", "m", "r", "t_d", "t_assign"):
+        setattr(a, k, cfg[k])
+    model = load_head(ck, dev)
+    rule_fn = s0.make_rule(cfg["rule"])
+    kw = decode_kwargs(a)
+    from sklearn.cluster import DBSCAN
+    dbscan = DBSCAN(eps=a.dbscan_eps, min_samples=a.dbscan_min_samples)
+    seed_kw = dict(t_beta=a.seed_t_beta, t_d=a.seed_t_d, t_assign=a.seed_t_assign)
+
+    def timed(fn):
+        base = 0
+        if cuda:
+            sync()
+            torch.cuda.reset_peak_memory_stats(dev)
+            base = torch.cuda.memory_allocated(dev)
+        t0 = time.perf_counter()
+        res = fn()
+        sync()
+        dt = time.perf_counter() - t0
+        peak = (torch.cuda.max_memory_allocated(dev) - base) / 1e6 if cuda else NAN
+        return res, dt, peak
+
+    def decoder(evd, mark=None):
+        x = infer_inputs(evd, mat, rule_fn, a.m, a.t_d, a.t_assign, dev, mark=mark)
+        return None if x is None else infer_labels(model, x, mark=mark, **kw)
+
+    def hardseed(evd):
+        fg_idx = evd["mask"].bool().nonzero(as_tuple=False).squeeze(1)
+        if fg_idx.numel() == 0:
+            return None
+        ox, beta = evd["ox"][fg_idx], evd["beta"][fg_idx]
+        return s0.seeds_and_labels(mat, ox, beta, rule_fn(beta.double().cpu()), a.t_d,
+                                   a.t_assign, dev)[1]
+
+    def backend(evd, name, **bkw):
+        return mat.materialize_labels(name, evd["ox"], evd["beta"], evd["mask"], None, 1, **bkw)[0]
+
+    stages = ["candidates", "topm", "forward", "merge", "decode"]
+    rows, n_warm, mismatches, n_seen = [], 0, 0, 0
+    t_start = time.perf_counter()
+    for ev in mb.iter_cache(a.cache, lo, hi):
+        if a.limit and n_seen >= a.limit:
+            break
+        d = prepare(ev, mat, rule_fn, a.m, a.t_d, a.t_assign, dev)     # evaluated path (untimed)
+        if d is None:
+            continue
+        with torch.no_grad():
+            evd = {k: ev[k].to(dev) for k in ("ox", "beta", "mask", "hit_x_fg")}
+            ref, _ = predict_labels(model, d, **kw)
+            lab, t_dec, pk_dec = timed(lambda: decoder(evd))
+            match = lab is not None and torch.equal(lab.cpu(), ref.cpu())
+            marks = []
+
+            def mark(name):
+                sync()
+                marks.append((name, time.perf_counter()))
+            sync()
+            t0 = time.perf_counter()
+            decoder(evd, mark)
+            _, t_hard, pk_hard = timed(lambda: hardseed(evd))
+            _, t_seed, pk_seed = timed(lambda: backend(evd, "seed", **seed_kw))
+            t_db = NAN
+            if not a.no_dbscan:
+                _, t_db, _ = timed(lambda: backend(evd, "dbscan", dbscan=dbscan))
+        if n_warm < a.warmup:
+            n_warm += 1
+            continue
+        n_seen += 1
+        mismatches += int(not match)
+        st, prev = {}, t0
+        for name, t in marks:
+            st[f"t_{name}_s"] = t - prev
+            prev = t
+        rows.append({"batch": ev["batch"], "event": ev["event"], "n_hit": int(ev["mask"].numel()),
+                     "n_fg": int(d["fg_idx"].numel()), "K": d["K"], "labels_match": int(match),
+                     "t_decoder_s": t_dec, "t_decoder_staged_s": prev - t0, **st,
+                     "t_hardseed_s": t_hard, "t_seed_backend_s": t_seed, "t_dbscan_s": t_db,
+                     "peak_decoder_mb": pk_dec, "peak_hardseed_mb": pk_hard,
+                     "peak_seed_backend_mb": pk_seed})
+    if not rows:
+        raise SystemExit("no timed events")
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    mb.write_rows(out / "timing_events.csv", rows)
+    col = lambda c: np.array([r.get(c, NAN) for r in rows], dtype=float)
+
+    def dist(c):
+        v = col(c)
+        v = v[np.isfinite(v)]
+        if not v.size:
+            return {}
+        return {"median_ms": 1e3 * float(np.median(v)), "mean_ms": 1e3 * float(v.mean()),
+                "p90_ms": 1e3 * float(np.percentile(v, 90)),
+                "p99_ms": 1e3 * float(np.percentile(v, 99)),
+                "max_ms": 1e3 * float(v.max()), "total_s": float(v.sum())}
+
+    methods = {"decoder": "t_decoder_s", "hard_seed": "t_hardseed_s",
+               "seed_backend": "t_seed_backend_s", "dbscan": "t_dbscan_s"}
+    summ = {m: dist(c) for m, c in methods.items()}
+    staged_mean = col("t_decoder_staged_s").mean()
+    breakdown = {s_: {**dist(f"t_{s_}_s"),
+                      "share_of_staged_mean": float(col(f"t_{s_}_s").mean() / staged_mean)}
+                 for s_ in stages}
+    ratio = lambda num, den: (summ[num]["total_s"] / summ[den]["total_s"]
+                              if summ.get(num) and summ.get(den) else NAN)
+    res = {"head": str(a.head), "head_sha256": mb.sha256(a.head), "head_epoch": cfg.get("epoch"),
+           "cache": str(a.cache), "batches": a.batches, "decode_kwargs": kw,
+           "seed_backend_kwargs": seed_kw,
+           "dbscan": None if a.no_dbscan else {"eps": a.dbscan_eps,
+                                               "min_samples": a.dbscan_min_samples},
+           "events_timed": len(rows), "warmup_events": n_warm,
+           "labels_match_evaluated_path": len(rows) - mismatches, "labels_mismatch": mismatches,
+           "methods": summ, "decoder_breakdown": breakdown,
+           "total_ratio": {"decoder_over_seed_backend": ratio("decoder", "seed_backend"),
+                           "decoder_over_hard_seed": ratio("decoder", "hard_seed"),
+                           "dbscan_over_decoder": ratio("dbscan", "decoder")},
+           "peak_mb": {k: {"max": float(np.nanmax(col(c))), "p95": float(np.nanpercentile(col(c), 95))}
+                       for k, c in (("decoder", "peak_decoder_mb"), ("hard_seed", "peak_hardseed_mb"),
+                                    ("seed_backend", "peak_seed_backend_mb"))} if cuda else None,
+           "env": {"device": str(dev), "gpu": torch.cuda.get_device_name(dev) if cuda else None,
+                   "torch": torch.__version__, "torch_threads": torch.get_num_threads(),
+                   "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+                   "nproc": os.cpu_count(), "cgroup_cpu_max": mb.cgroup_cpu_max()},
+           "wall_s": time.perf_counter() - t_start, **_prov(mat)}
+    (out / "timing_summary.json").write_text(json.dumps(res, indent=2))
+    print(f"{'method':14s} {'median ms':>10s} {'mean ms':>9s} {'p90 ms':>8s} {'p99 ms':>8s} {'total s':>8s}")
+    for m_, v in summ.items():
+        if v:
+            print(f"{m_:14s} {v['median_ms']:10.2f} {v['mean_ms']:9.2f} {v['p90_ms']:8.2f} "
+                  f"{v['p99_ms']:8.2f} {v['total_s']:8.2f}")
+    print("decoder stages (with per-stage sync):")
+    for s_, v in breakdown.items():
+        print(f"  {s_:11s} median {v['median_ms']:8.2f} ms  mean {v['mean_ms']:8.2f} ms  "
+              f"share {100 * v['share_of_staged_mean']:5.1f} %")
+    print(json.dumps(res["total_ratio"]), f"events {len(rows)}, label mismatches {mismatches}")
+    print(f"wrote {out}/timing_summary.json")
+    if mismatches:
+        raise SystemExit(f"FAIL: timed labels differ from the evaluated path on {mismatches} events")
+
+
 def cmd_selftest(a):
     """Synthetic end-to-end check: separable blobs must be learnable and decodable."""
     import torch
@@ -892,6 +1107,22 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--deva-end", type=int, default=150)
     s.set_defaults(fn=cmd_diagnose)
+
+    s = sub.add_parser("time"); common(s)
+    s.add_argument("--head", required=True)
+    s.add_argument("--cache", required=True)
+    s.add_argument("--batches", default="0:150")
+    s.add_argument("--out", required=True)
+    s.add_argument("--deva-end", type=int, default=150)
+    s.add_argument("--warmup", type=int, default=8, help="untimed warm-up events (as mat_bench)")
+    s.add_argument("--limit", type=int, default=0, help="stop after N timed events (0 = all)")
+    s.add_argument("--seed-t-beta", type=float, default=0.5)
+    s.add_argument("--seed-t-d", type=float, default=0.3)
+    s.add_argument("--seed-t-assign", type=float, default=float("inf"))
+    s.add_argument("--dbscan-eps", type=float, default=0.3)
+    s.add_argument("--dbscan-min-samples", type=int, default=15)
+    s.add_argument("--no-dbscan", action="store_true")
+    s.set_defaults(fn=cmd_time)
 
     s = sub.add_parser("selftest"); common(s)
     s.set_defaults(fn=cmd_selftest, device="cpu")
