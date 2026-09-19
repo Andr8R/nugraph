@@ -177,16 +177,27 @@ def test_trunk_checkpoint_loads_with_unchanged_nugraph(tmp_path):
                              semantic_classes=("a", "b", "diffuse"), event_classes=("x", "y"),
                              event_head=True, semantic_head=True, filter_head=False,
                              instance_head=True)
-    base = {"state_dict": net.state_dict(), "hyper_parameters": dict(net.hparams),
-            "pytorch-lightning_version": pl.__version__}
+    base = {"state_dict": {k: v.clone() for k, v in net.state_dict().items()},
+            "hyper_parameters": dict(net.hparams), "pytorch-lightning_version": pl.__version__}
+    # "fine-tuned" state. InputNorm keeps running statistics as non-trainable Parameters,
+    # including an integer `count`, so only floating-point tensors get the float offset.
+    counts = [k for k, v in net.named_parameters() if not v.is_floating_point()]
+    assert counts, "expected InputNorm's integer running count among the parameters"
     with torch.no_grad():
         for p_ in net.parameters():
-            p_.add_(0.5)                                   # "fine-tuned" weights
+            if p_.is_floating_point():
+                p_.add_(0.5)
+            else:
+                p_.fill_(123)
     path = tmp_path / "trunk.ckpt"
     ft.save_trunk(net, base, path, {"epoch": 0, "global_step": 3, "arm": "T"})
     back = ng.models.NuGraph3.load_from_checkpoint(path, map_location="cpu")
-    for k, v in net.state_dict().items():
-        assert torch.equal(back.state_dict()[k], v)
+    state, loaded = net.state_dict(), back.state_dict()
+    assert set(loaded) == set(state)
+    for k, v in state.items():
+        assert loaded[k].dtype == v.dtype and torch.equal(loaded[k], v), k
+    assert all(int(loaded[k].flatten()[0]) == 123 for k in counts)
+    assert any(not torch.equal(loaded[k], base["state_dict"][k]) for k in state)   # not the base
 
 
 def test_dev_identity_accepts_matching_and_refuses_other_events(tmp_path):
