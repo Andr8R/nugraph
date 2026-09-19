@@ -288,11 +288,22 @@ def build_module(a, net, soft, head_cfg, base_ckpt, mat, out):
     return SoftFinetune()
 
 
+def n_hits(sample):
+    """Hit count of one dataset sample. The sample must stay referenced while its node store is
+    read: PyG node stores hold only a weak reference to their HeteroData, and `num_nodes` needs
+    it, so `dataset[i]["hit"].num_nodes` fails once the temporary sample is freed."""
+    store = sample["hit"]
+    n = store.num_nodes
+    if n is None:
+        raise SystemExit(f"cannot infer the hit count from keys {sorted(store.keys())}")
+    return int(n)
+
+
 def dev_identity(val_dataset, lo, hi, cache):
     """Validation samples [lo*8, hi*8) must be the dev-A cache's events, in order."""
     idx = range(lo * DEV_BATCH, hi * DEV_BATCH)
     cache_n = [int(ev["mask"].numel()) for ev in mb.iter_cache(cache, lo, hi)]
-    data_n = [int(val_dataset[i]["hit"].num_nodes) for i in idx]
+    data_n = [n_hits(val_dataset[i]) for i in idx]
     if cache_n != data_n:
         bad = next((i for i, (x, y) in enumerate(zip(cache_n, data_n)) if x != y), None)
         raise SystemExit(f"dev subset != dev cache: {len(data_n)} vs {len(cache_n)} events, "

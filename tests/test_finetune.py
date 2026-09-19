@@ -4,7 +4,6 @@ Run:  pytest -q tests/test_finetune.py
 """
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -200,14 +199,47 @@ def test_trunk_checkpoint_loads_with_unchanged_nugraph(tmp_path):
     assert any(not torch.equal(loaded[k], base["state_dict"][k]) for k in state)   # not the base
 
 
-def test_dev_identity_accepts_matching_and_refuses_other_events(tmp_path):
+class _HeteroDataset:
+    """Like NuGraphDataset: every __getitem__ builds a fresh HeteroData, so a node store taken
+    from it outlives its (weakly referenced) parent unless the sample is kept."""
+
+    def __init__(self, sizes):
+        self.sizes = list(sizes)
+
+    def __len__(self):
+        return len(self.sizes)
+
+    def __getitem__(self, i):
+        from torch_geometric.data import HeteroData
+        data = HeteroData()
+        data["hit"].x = torch.zeros(self.sizes[i], 3)
+        data["sp"].x = torch.zeros(2, 3)
+        return data
+
+
+def _dev_cache(tmp_path, sizes):
     cache = tmp_path / "cache"
     cache.mkdir()
-    sizes = [5, 7, 3, 9, 4, 6, 8, 2, 5, 5, 6, 7, 1, 2, 3, 4]      # 2 batches of 8
     torch.save([{"batch": i // 8, "event": i % 8, "mask": torch.ones(n, dtype=torch.bool)}
                 for i, n in enumerate(sizes)], cache / "shard_0000.pt")
-    ds = [{"hit": SimpleNamespace(num_nodes=n)} for n in sizes]
-    assert ft.dev_identity(ds, 0, 2, cache) == list(range(16))
-    ds[9] = {"hit": SimpleNamespace(num_nodes=99)}
+    return cache
+
+
+SIZES = [5, 7, 3, 9, 4, 6, 8, 2, 5, 5, 6, 7, 1, 2, 3, 4]            # 2 batches of 8
+
+
+def test_n_hits_reads_a_temporary_pyg_sample():
+    pytest.importorskip("torch_geometric")
+    ds = _HeteroDataset(SIZES)
+    assert [ft.n_hits(ds[i]) for i in range(len(ds))] == SIZES
+
+
+def test_dev_identity_accepts_matching_and_refuses_other_events(tmp_path):
+    pytest.importorskip("torch_geometric")
+    cache = _dev_cache(tmp_path, SIZES)
+    assert ft.dev_identity(_HeteroDataset(SIZES), 0, 2, cache) == list(range(16))
+    assert ft.dev_identity(_HeteroDataset(SIZES), 1, 2, cache) == list(range(8, 16))
+    wrong = list(SIZES)
+    wrong[9] = 99
     with pytest.raises(SystemExit):
-        ft.dev_identity(ds, 0, 2, cache)
+        ft.dev_identity(_HeteroDataset(wrong), 0, 2, cache)
