@@ -111,23 +111,133 @@ def test_soft_checkpointing_does_not_change_loss_or_gradients():
     assert torch.allclose(ta[0].grad, tb[0].grad, atol=1e-5)
 
 
-def test_seeded_sampler_order_is_reproducible_and_leaves_global_rng_alone():
+def test_seeded_sampler_order_is_a_pure_function_of_seed_and_epoch():
     sizes = np.arange(1, 201)
     s1 = ft.seeded_balance_sampler(sizes, 8, 0.1, seed=1)
     s2 = ft.seeded_balance_sampler(sizes, 8, 0.1, seed=1)
     np.random.seed(0)
-    e0 = list(iter(s1))
+    e0, e1 = s1.epoch_order(0), s1.epoch_order(1)
     np.random.rand(17)                                     # other RNG use in between
-    e1 = list(iter(s1))
-    np.random.seed(99)
-    assert list(iter(s2)) == e0 and list(iter(s2)) == e1
+    assert s2.epoch_order(1) == e1 and s2.epoch_order(0) == e0
     assert e0 != e1                                        # epochs differ
-    assert list(iter(ft.seeded_balance_sampler(sizes, 8, 0.1, seed=2))) != e0
+    assert ft.seeded_balance_sampler(sizes, 8, 0.1, seed=2).epoch_order(0) != e0
     np.random.seed(5)
     ref = np.random.rand()
     np.random.seed(5)
-    list(iter(ft.seeded_balance_sampler(sizes, 8, 0.1, seed=3)))
+    s1.epoch_order(3)
+    list(iter(s1))
     assert np.random.rand() == ref                         # global state restored
+    s1.epoch, s1.skip = 1, 24
+    assert list(iter(s1)) == e1[24:]                       # resumed mid-epoch
+
+
+# --------------------------------------------------------------------------- #
+# exact resume (generic loop, CPU, bitwise)
+# --------------------------------------------------------------------------- #
+class ToyLoop(ft.ResumableLoop):
+    """Tiny model trained through the same ResumableLoop; consumes torch and numpy RNG in
+    step() and end_epoch() so that RNG restoration is exercised."""
+
+    def __init__(self, out, init_seed=3, epochs=3, resume_every=3, limit=None, lr=0.05):
+        out.mkdir(parents=True, exist_ok=True)
+        super().__init__(out, epochs, {"toy": 1, "epochs": epochs, "lr": lr}, resume_every, limit)
+        torch.manual_seed(init_seed)
+        self.model = torch.nn.Linear(3, 1)
+        g = torch.Generator().manual_seed(0)
+        self.X, self.Y = torch.randn(40, 3, generator=g), torch.randn(40, 1, generator=g)
+        self.bs = 4
+        self.sampler = ft.seeded_balance_sampler(np.arange(1, 41), self.bs, 0.1, seed=7)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+
+    def modules(self):
+        return {"model": self.model}
+
+    def batches(self, epoch, skip):
+        order = self.sampler.epoch_order(epoch)
+        for k in range(skip, len(order) // self.bs):
+            ids = order[k * self.bs:(k + 1) * self.bs]
+            yield ids, torch.tensor(ids)
+
+    def step(self, batch):
+        self.optimizer.zero_grad(set_to_none=True)
+        noise = 0.01 * torch.randn(len(batch), 1)
+        loss = ((self.model(self.X[batch]) + noise - self.Y[batch]) ** 2).mean()
+        loss.backward()
+        self.optimizer.step()
+        return {"loss": float(loss.detach()), "np": float(np.random.rand())}
+
+    def end_epoch(self, epoch):
+        self.hist.append({"epoch": epoch, "loss": self.tr["loss"] / self.tr["n"],
+                          "n": self.tr["n"], "r": float(torch.rand(1))})
+
+
+def _steps(path):
+    import csv
+    with open(path / "steps.csv") as f:
+        return [{k: v for k, v in r.items() if k != "step_s"} for r in csv.DictReader(f)]
+
+
+def _uninterrupted(out):
+    np.random.seed(1)
+    loop = ToyLoop(out)
+    loop.run()
+    return loop
+
+
+def _check_same(ref, other, ref_dir, other_dir):
+    for (k, p), (_, q) in zip(ref.model.state_dict().items(), other.model.state_dict().items()):
+        assert torch.equal(p, q), k
+    assert other.hist == ref.hist
+    assert _steps(other_dir) == _steps(ref_dir)
+    assert other.st == ref.st
+
+
+@pytest.mark.parametrize("crash", [
+    {"crash_at_step": 7},          # mid-epoch, between two resume saves (steps.csv truncated)
+    {"crash_at_step": 12},         # exactly at a resume save
+    {"crash_after_epoch": 0},      # after an epoch's validation, before its resume save
+    {"crash_after_epoch": 2},      # after the last epoch, before the final save
+])
+def test_interrupted_and_resumed_run_equals_uninterrupted(tmp_path, crash):
+    ref = _uninterrupted(tmp_path / "ref")
+    assert ref.st["epoch"] == 3 and ref.st["global_step"] > 20
+    np.random.seed(1)
+    first = ToyLoop(tmp_path / "run")
+    with pytest.raises(ft.SimulatedCrash):
+        first.run(**crash)
+    np.random.seed(12345)                                  # a fresh process: other init, RNG
+    torch.manual_seed(999)
+    resumed = ToyLoop(tmp_path / "run", init_seed=77)
+    resumed.load_resume()
+    resumed.run()
+    _check_same(ref, resumed, tmp_path / "ref", tmp_path / "run")
+
+
+def test_resume_twice_and_after_completion(tmp_path):
+    ref = _uninterrupted(tmp_path / "ref")
+    np.random.seed(1)
+    with pytest.raises(ft.SimulatedCrash):
+        ToyLoop(tmp_path / "run").run(crash_at_step=5)
+    second = ToyLoop(tmp_path / "run", init_seed=8)
+    second.load_resume()
+    with pytest.raises(ft.SimulatedCrash):
+        second.run(crash_at_step=17)
+    third = ToyLoop(tmp_path / "run", init_seed=9)
+    third.load_resume()
+    third.run()
+    _check_same(ref, third, tmp_path / "ref", tmp_path / "run")
+    done = ToyLoop(tmp_path / "run", init_seed=10)          # resuming a finished run: no-op
+    done.load_resume()
+    done.run()
+    _check_same(ref, done, tmp_path / "ref", tmp_path / "run")
+
+
+def test_resume_refuses_a_changed_configuration(tmp_path):
+    np.random.seed(1)
+    with pytest.raises(ft.SimulatedCrash):
+        ToyLoop(tmp_path / "run").run(crash_at_step=4)
+    with pytest.raises(SystemExit):
+        ToyLoop(tmp_path / "run", lr=0.01).load_resume()
 
 
 def test_sparse_overlap_equals_dense_values_and_gradients():
