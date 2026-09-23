@@ -88,3 +88,42 @@ def test_env_report_records_limits_and_versions(tmp_path):
     for k in ("python", "h5py", "numpy", "torch", "cpu_affinity", "file_gb", "n_train"):
         assert k in info, k
     assert info["n_train"] == 40 and info["file_gb"] > 0
+
+
+def test_loader_variants_use_disjoint_blocks_by_default(tmp_path, monkeypatch):
+    """Each worker count must read its own cold samples; a shared block measures the page cache."""
+    p = tiny_file(tmp_path / "t.h5", n=200)
+    seen = []
+
+    def fake_names(data_path, split, n, offset, order):
+        seen.append((n, offset))
+        return [f"evt{i:03d}" for i in range(offset, offset + n)], 200
+    monkeypatch.setattr(ib, "sample_names", fake_names)
+    monkeypatch.setattr(ib, "env_report", lambda *a, **k: {})
+
+    class FakeLoader:
+        def __init__(self, *a, **k):
+            pass
+
+        def __iter__(self):
+            return iter(())
+    monkeypatch.setitem(__import__("sys").modules, "torch_geometric.loader",
+                        type("m", (), {"DataLoader": FakeLoader}))
+    a = type("A", (), {"data_path": str(p), "split": "train", "n": 192, "offset": 100,
+                       "order": "dataset", "workers": [0, 4, 8], "prefetch": 4,
+                       "shared_samples": False, "json": None})()
+    ib.cmd_loader(a)
+    assert seen == [(64, 100), (64, 164), (64, 228)]           # disjoint, 192/3 each
+    seen.clear()
+    a.shared_samples = True
+    ib.cmd_loader(a)
+    assert seen == [(192, 100)] * 3                            # same block, warm after the first
+
+
+def test_loader_refuses_too_few_samples_per_variant(tmp_path):
+    p = tiny_file(tmp_path / "t.h5")
+    a = type("A", (), {"data_path": str(p), "split": "train", "n": 60, "offset": 0,
+                       "order": "dataset", "workers": [0, 4, 8], "prefetch": 4,
+                       "shared_samples": False, "json": None})()
+    with pytest.raises(SystemExit):
+        ib.cmd_loader(a)

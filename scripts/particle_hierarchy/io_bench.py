@@ -10,7 +10,10 @@ page-cache warm-up explains it). This measures the pipeline directly, separating
            order, so locality is visible. Bytes/s is reported from the actual record sizes.
   loader   end-to-end batches/s through a real DataLoader with `--workers 0 2 4 8`, using a
            lazy-open dataset (the HDF5 handle is opened inside each worker, which is what makes
-           num_workers > 0 possible at all here). Semantics are unchanged: same samples, same order.
+           num_workers > 0 possible at all here). Semantics are unchanged: same order, same batching.
+           Each worker count reads a DISJOINT block of samples by default, because a second pass over
+           the same samples measures the page cache (warm reads are ~10x faster here), not the loader;
+           --shared-samples restores the old, cache-contaminated behaviour on purpose.
   env      versions, cgroup CPU/memory limits, MemAvailable, h5py chunk cache, file size.
 
 Every mode prints JSON too (--json). Nothing is written to the dataset; no training state is touched.
@@ -191,14 +194,20 @@ def cmd_loader(a):
     from torch.utils.data import Subset
     from torch_geometric.loader import DataLoader
 
-    names, total = sample_names(a.data_path, a.split, a.n, a.offset, a.order)
+    nvar = len(a.workers)
+    per = a.n if a.shared_samples else a.n // nvar
+    if not a.shared_samples and per < 32:
+        raise SystemExit(f"--n {a.n} over {nvar} worker counts gives {per} samples each; use --n >= {32*nvar}")
     transform = ng.models.NuGraph3.transform(planes=("u", "v", "y"))
     ds = LazyDataset(a.data_path, a.split, transform)
     lookup = {n: i for i, n in enumerate(ds.names)}
-    idx = [lookup[n] for n in names]                        # same samples, same order, every variant
     out = {"mode": "loader", "split": a.split, "order": a.order, "offset": a.offset,
-           "n_samples": len(idx), "batch_size": 32, "variants": {}, "env": env_report(a.data_path)}
-    for w in a.workers:
+           "samples_per_variant": per, "shared_samples": a.shared_samples,
+           "batch_size": 32, "variants": {}, "env": env_report(a.data_path)}
+    for vi, w in enumerate(a.workers):
+        off = a.offset if a.shared_samples else a.offset + vi * per
+        names, total = sample_names(a.data_path, a.split, per, off, a.order)
+        idx = [lookup[n] for n in names]                    # disjoint block per variant unless shared
         kw = dict(batch_size=32, num_workers=w, pin_memory=True, shuffle=False, drop_last=True)
         if w:
             kw.update(persistent_workers=True, prefetch_factor=a.prefetch)
@@ -214,11 +223,14 @@ def cmd_loader(a):
         del it, loader
         steady = times[1:] or times
         out["variants"][f"workers={w}"] = {
+            "offset": off, "cold": not a.shared_samples,
             "batches": len(times), "first_batch_s": first,
             "mean_s": statistics.fmean(steady), "median_s": statistics.median(steady),
             "total_s": sum(times)}
         print(f"  workers={w}: {statistics.median(steady):.3f} s/batch median "
               f"({statistics.fmean(steady):.3f} mean, first {first:.2f}, {len(times)} batches)", flush=True)
+    if not a.shared_samples:
+        print("  (each worker count read a disjoint, cold block of samples)")
     base = out["variants"].get("workers=0", {}).get("median_s")
     if base:
         for k, v in out["variants"].items():
@@ -251,6 +263,9 @@ def main(argv=None):
         if name == "loader":
             s.add_argument("--workers", type=int, nargs="+", default=[0, 4])
             s.add_argument("--prefetch", type=int, default=4)
+            s.add_argument("--shared-samples", action="store_true",
+                           help="all worker counts read the SAME samples (warm after the first pass; "
+                                "only for measuring cached throughput)")
         s.set_defaults(fn=fn)
     a = p.parse_args(argv)
     return a.fn(a)
