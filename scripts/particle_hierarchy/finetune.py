@@ -278,7 +278,23 @@ def tick(timers, sync, key, t0):
 
 
 PROFILE_STAGES = ("to_device", "nugraph_fwd", "ev_inputs", "prepare", "swap_grad_tensors",
-                  "soft_fwd", "soft_other", "backward", "optimizer")
+                  "soft_fwd", "soft_other", "backward", "backward_ng", "backward_soft", "optimizer")
+
+
+def validate_profile_args(a):
+    """--profile-split-backward is only sound in arm C, where the two graphs are disjoint.
+
+    In arm C the soft layer sees detached copies, so the NuGraph loss reaches only the trunk and the
+    soft loss only the soft layer: backward on each separately accumulates exactly the same gradients
+    as one backward on the sum. In arm T the soft loss reaches the trunk too, so a split would walk
+    the trunk twice -- slower AND wrongly attributed.
+    """
+    if a.profile_split_backward:
+        if a.arm != "C":
+            raise SystemExit("--profile-split-backward requires --arm C (in arm T the soft loss also "
+                             "flows into the trunk, so the split double-counts the trunk backward)")
+        if not a.profile_steps:
+            raise SystemExit("--profile-split-backward needs --profile-steps N")
 
 
 def profile_row(global_step, epoch, timers, step_total, extras):
@@ -419,8 +435,14 @@ class Stage1bLoop(ResumableLoop):
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {self.st['global_step']}: "
                                f"nugraph {float(loss_ng)}, soft {terms.tolist()}")
-        loss.backward()
-        t0 = tick(timers, sync, "backward", t0)
+        if prof and self.a.profile_split_backward:              # arm C only; see validate_profile_args
+            loss_ng.backward()
+            t0 = tick(timers, sync, "backward_ng", t0)
+            (self.a.lam * soft_loss).backward()
+            t0 = tick(timers, sync, "backward_soft", t0)
+        else:
+            loss.backward()
+            t0 = tick(timers, sync, "backward", t0)
         torch.nn.utils.clip_grad_norm_(self.soft.parameters(), 1.0)       # soft layer only
         self.optimizer.step()
         t0 = tick(timers, sync, "optimizer", t0)
@@ -624,11 +646,16 @@ def main():
                    help="diagnostic: record a per-stage timing breakdown for the first N steps into "
                         "profile.csv. Adds device syncs, so those steps are slightly slower and must "
                         "not be used for throughput; the maths and the data order are unchanged")
+    p.add_argument("--profile-split-backward", action="store_true",
+                   help="diagnostic (arm C + --profile-steps only): backward the NuGraph and soft "
+                        "losses separately to split the backward into trunk and soft layer. The two "
+                        "graphs are disjoint in arm C, so the gradients are the same")
     p.add_argument("--resume-every", type=int, default=100, help="steps between resume saves")
     p.add_argument("--resume", action="store_true", help="continue from --out/resume.pt")
     p.add_argument("--crash-at-step", type=int, default=None,
                    help="testing only: raise after this global step (resume verification)")
     a = p.parse_args()
+    validate_profile_args(a)
 
     import torch
     from torch.utils.data import Subset
@@ -695,7 +722,8 @@ def main():
                     "training_loop": "explicit loop with exact resume (no Lightning Trainer)",
                     "loader": {"num_workers": a.num_workers,
                                "prefetch_factor": a.prefetch_factor, "pin_memory": True},
-                    "profile_steps": a.profile_steps}
+                    "profile_steps": a.profile_steps,
+                    "profile_split_backward": a.profile_split_backward}
     man_path.write_text(json.dumps(manifest, indent=2, default=str))
 
     if not loop.extra.get("baseline_done"):

@@ -156,15 +156,55 @@ def test_profile_row_accounts_for_every_second_of_the_step():
     assert row["t_unattributed_s"] == pytest.approx(0.5)              # 2.0 - (0.5 + 1.0)
 
 
+def test_split_backward_is_exact_when_the_graphs_are_disjoint():
+    """Arm C's claim: separate backwards accumulate the same gradients as one backward on the sum.
+
+    The soft layer sees detached copies in arm C, so it shares no node with the trunk graph; a stand-in
+    trunk loss on its own parameters reproduces that structure.
+    """
+    soft = new_soft()
+    trunk = torch.nn.Linear(4, 1)
+    x = torch.ones(2, 4)
+
+    def grads(split):
+        soft.zero_grad()
+        trunk.zero_grad()
+        terms, _ = soft_loss(soft, batch_tensors(), grad_to_trunk=False)
+        loss_ng = trunk(x).square().mean()
+        if split:
+            loss_ng.backward()
+            (1.0 * terms.sum()).backward()
+        else:
+            (loss_ng + 1.0 * terms.sum()).backward()
+        return [p.grad.clone() for p in list(trunk.parameters()) + list(soft.parameters())]
+
+    for g1, g2 in zip(grads(False), grads(True)):
+        assert torch.equal(g1, g2)
+
+
+def test_split_backward_is_refused_outside_arm_c():
+    a = type("A", (), {"profile_split_backward": True, "arm": "T", "profile_steps": 50})()
+    with pytest.raises(SystemExit, match="requires --arm C"):
+        ft.validate_profile_args(a)
+    a.arm, a.profile_steps = "C", 0
+    with pytest.raises(SystemExit, match="profile-steps"):
+        ft.validate_profile_args(a)
+    a.profile_steps = 50
+    assert ft.validate_profile_args(a) is None                        # arm C + profiling is allowed
+    ft.validate_profile_args(type("A", (), {"profile_split_backward": False, "arm": "T",
+                                            "profile_steps": 0})())   # off: never refuses
+
+
 def test_profile_steps_is_not_part_of_the_resume_identity(tmp_path):
     """Profiling changes who is watching, not what is computed, so it must not block a resume."""
     a = type("A", (), {k: v for k, v in dict(
         arm="T", seed=1, lam=1.0, lr=1e-4, head_lr=1e-3, epochs=5, batch_size=32,
         balance_frac=0.1, limit_train_batches=None, dev_batches="0:2", no_soft_checkpoint=False,
         resume_every=100, data_path=str(tmp_path / "d.h5"), num_workers=4, prefetch_factor=2,
-        profile_steps=100).items()})()
+        profile_steps=100, profile_split_backward=False).items()})()
     cfg = ft.run_config(a, "sha", "hsha", {"git_commit": "c", "git_dirty": False})
-    assert "profile_steps" not in cfg and "num_workers" not in cfg
+    for k in ("profile_steps", "profile_split_backward", "num_workers", "prefetch_factor"):
+        assert k not in cfg, k
     a.profile_steps = 0
     assert ft.run_config(a, "sha", "hsha", {"git_commit": "c", "git_dirty": False}) == cfg
 
