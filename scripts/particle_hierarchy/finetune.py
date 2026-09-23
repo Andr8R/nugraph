@@ -649,7 +649,9 @@ def main():
     p.add_argument("--profile-split-backward", action="store_true",
                    help="diagnostic (arm C + --profile-steps only): backward the NuGraph and soft "
                         "losses separately to split the backward into trunk and soft layer. The two "
-                        "graphs are disjoint in arm C, so the gradients are the same")
+                        "graphs are disjoint in arm C, so the gradients are the same. Costs ~4.6 GB of "
+                        "extra peak memory: forcing the trunk backward first keeps the whole soft graph "
+                        "alive, which a single backward does not -- measurement only, never a real run")
     p.add_argument("--resume-every", type=int, default=100, help="steps between resume saves")
     p.add_argument("--resume", action="store_true", help="continue from --out/resume.pt")
     p.add_argument("--crash-at-step", type=int, default=None,
