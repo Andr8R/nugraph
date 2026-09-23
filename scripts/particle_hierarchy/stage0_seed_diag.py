@@ -38,7 +38,7 @@ mb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mb)
 
 NAN = float("nan")
-TOPK = (1, 2, 3, 5)
+TOPK = (1, 2, 3, 5, 10, 20, 50)   # the neighbourhood widths the soft head could use (M)
 LOGIT_EPS = 1e-6
 
 
@@ -491,14 +491,16 @@ def summarize_headroom(rows, by_sem, by_size, size_bins, marg, out, a):
         L.append(f"- (beta_max<=0.5 events, n={len(low)}: decoder {np.nanmean(g(low,'ari_particle_decoder')):.4f}, "
                  f"top-3 oracle {np.nanmean(g(low,'ari_particle_top3')):.4f})")
     L += ["", "**By true semantic class (hit-weighted)**", "",
-          "| class | hits | unreachable | top-1 | top-2 | top-3 | top-5 |", "|---|---|---|---|---|---|---|"]
+          "| class | hits | unreachable | " + " | ".join(f"top-{m}" for m in TOPK) + " |",
+          "|---|---|" + "---|" * (len(TOPK) + 1)]
     names = ["pion", "muon", "kaon", "hadron", "shower", "michel", "diffuse"]
     for k in sorted(by_sem):
         s = by_sem[k]
         L.append(f"| {names[k] if 0 <= k < len(names) else k} | {s['n']} | {s['unreach']/s['n']:.3f} | "
                  + " | ".join(f"{s[m]/s['n']:.3f}" for m in TOPK) + " |")
     L += ["", "**By true particle size (population hits per particle)**", "",
-          "| size bin | hits | unreachable | top-1 | top-2 | top-3 | top-5 |", "|---|---|---|---|---|---|---|"]
+          "| size bin | hits | unreachable | " + " | ".join(f"top-{m}" for m in TOPK) + " |",
+          "|---|---|" + "---|" * (len(TOPK) + 1)]
     for k in sorted(by_size):
         s = by_size[k]
         lo_ = size_bins[k - 1] if k >= 1 else 0
