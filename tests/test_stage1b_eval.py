@@ -204,7 +204,7 @@ def fake_runs(root, commit="a61a01b", lam=1.0, unfinished=None):
     return root
 
 
-def test_plan_prints_the_frozen_tool_commands_for_devB(tmp_path, capsys):
+def test_plan_prints_the_frozen_tool_commands_for_devB(tmp_path, capsys):  # noqa
     runs = fake_runs(tmp_path / "runs")
     a = type("A", (), {"runs": str(runs), "out": str(tmp_path / "eval"), "split": "devB",
                        "data_path": "/data.h5", "device": "0", "arms": None})()
@@ -232,7 +232,8 @@ def test_smoke_split_stays_on_dev_A(tmp_path, capsys):
     ev.cmd_plan(a, execute=False)
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
     assert len(lines) == 7 and all("--batches 0:2" in ln for ln in lines)
-    assert ev.SPLITS == {"devB": "150:314", "smoke": "0:2"}
+    assert ev.SPLITS["devB"] == {"split": "validation", "batches": "150:314", "guard": []}
+    assert ev.SPLITS["smoke"]["batches"] == "0:2" and not any("--allow-heldout" in ln for ln in lines)
 
 
 @pytest.mark.parametrize("bad", [dict(unfinished="C_s2"), dict(commit=None)])
@@ -263,3 +264,57 @@ def test_run_refuses_changed_trunks_midway(tmp_path, monkeypatch):
     (runs / "T_s1" / "trunk_ep4.ckpt").write_bytes(b"changed")
     with pytest.raises(SystemExit, match="changed"):
         ev.cmd_plan(a, execute=True)
+
+
+def test_test_split_uses_nugraph_test_samples_and_waives_dev_guards(tmp_path, capsys):
+    runs = fake_runs(tmp_path / "runs")
+    a = type("A", (), {"runs": str(runs), "out": str(tmp_path / "eval"), "split": "test",
+                       "data_path": "/d.h5", "device": "0", "arms": ["T_s1"],
+                       "ref_trunk": None, "ref_head": None})()
+    ev.cmd_plan(a, execute=False)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert len(lines) == 7 and all("--batches 0:" in ln for ln in lines)
+    assert "--split test" in lines[0] and "--store-hit-x" in lines[0]
+    assert all("--allow-heldout" in ln for ln in (lines[1], lines[5], lines[6]))   # soft, headroom, rules
+    assert not any("--allow-heldout" in ln for ln in lines[2:5])                   # bench has no guard
+    assert "--decode v2 --no-null --merge-thr 0.5" in lines[1]                     # criteria unchanged
+
+
+def test_reference_arm_is_planned_but_never_part_of_the_criteria(tmp_path, capsys):
+    runs = fake_runs(tmp_path / "runs")
+    ref_t, ref_h = tmp_path / "ep29.ckpt", tmp_path / "frozen.pt"
+    ref_t.write_bytes(b"ep29")
+    ref_h.write_bytes(b"frozen")
+    a = type("A", (), {"runs": str(runs), "out": str(tmp_path / "eval"), "split": "test",
+                       "data_path": "/d.h5", "device": "0", "arms": None,
+                       "ref_trunk": str(ref_t), "ref_head": str(ref_h)})()
+    ev.cmd_plan(a, execute=False)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert len(lines) == 5 * 7                                   # four arms + the reference
+    ref_lines = [ln for ln in lines if ln.startswith(f"[{ev.REF}]")]
+    assert len(ref_lines) == 7 and f"--checkpoint {ref_t}" in ref_lines[0] and f"--head {ref_h}" in ref_lines[1]
+    a.ref_head = None
+    with pytest.raises(SystemExit):                              # both or neither
+        ev.cmd_plan(a, execute=False)
+
+
+def test_reference_block_is_reported_without_changing_the_verdicts(tmp_path):
+    base = scenario(tmp_path)
+    assert "reference_ep29" not in base
+    rng = np.random.default_rng(3)
+    make_arm(tmp_path, ev.REF, "devB", hard=0.16 + 0.01 * rng.standard_normal(N),
+             soft=0.24 + 0.01 * rng.standard_normal(N))
+    res = ev.cmd_report(type("A", (), {"out": str(tmp_path), "split": "devB", "runs": None,
+                                       "stage1a_events": None})())
+    for k in ("G", "R1", "R2", "S"):
+        assert res[k]["pass"] == base[k]["pass"]                  # criteria untouched
+    ref = res["reference_ep29"]
+    assert ref["soft"]["mean"] == pytest.approx(0.24, abs=0.01)
+    assert ref["soft"]["T_minus_ref"]["n"] == N and ref["soft"]["T_minus_ref"]["mean"] > 0
+    assert "Reference: ep29 trunk" in (tmp_path / "report.md").read_text()
+
+
+def test_test_split_report_is_a_decision(tmp_path):
+    res = scenario(tmp_path, split="test")
+    assert res["decision"] is True and res["nugraph_split"] == "test"
+    assert "NOT a decision" not in (tmp_path / "report.md").read_text()

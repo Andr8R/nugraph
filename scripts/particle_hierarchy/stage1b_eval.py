@@ -22,8 +22,10 @@ pre-registered interpretation. Clarifications fixed before dev-B was read are li
   stage1b_eval.py run    ...same...            (resumable: finished steps are skipped)
   stage1b_eval.py report --runs $S1B --out $S1B/eval_devB --split devB [--stage1a-events CSV]
 
-`--split smoke` (dev-A batches 0:2) exercises the whole chain without touching dev-B; its report is
-labelled as a mechanics check, never a decision.
+`--split test` is the pre-registered FINAL evaluation on NuGraph's own test samples, with the same
+criteria; `--ref-trunk/--ref-head` add the ep29 + frozen Stage-1a reference arm, reported beside the
+four arms and never part of the criteria. `--split smoke` (dev-A batches 0:2) exercises the whole chain
+without touching dev-B or test; its report is labelled as a mechanics check, never a decision.
 """
 import argparse
 import csv
@@ -44,8 +46,14 @@ ARMS = ("T_s1", "C_s1", "T_s2", "C_s2")
 PAIRS = (("T_s1", "C_s1"), ("T_s2", "C_s2"))
 FINAL_EPOCH = 4
 RULE = "quant:0.995:0.05:0.5"
-SPLITS = {"devB": "150:314",        # the pre-registered decision split, used once
-          "smoke": "0:2"}           # dev-A, mechanics only
+SPLITS = {                          # name -> NuGraph split, batch range, extra guard flags
+    "devB": {"split": "validation", "batches": "150:314", "guard": []},
+    "smoke": {"split": "validation", "batches": "0:2", "guard": []},          # dev-A, mechanics only
+    # the pre-registered FINAL split: NuGraph's own test samples, never used in this workspace.
+    # The dev-split guards of soft_particle/stage0 count validation batches, so they are waived here.
+    "test": {"split": "test", "batches": "0:", "guard": ["--allow-heldout"]},
+}
+REF = "ref_ep29"                    # optional reference arm: ep29 trunk + frozen Stage-1a head
 SEED_TAG = "seed_tb0.5_td0.3_tainf"
 DB03_TAG = "dbscan_eps0.3_min15"
 DB02_TAG = "dbscan_eps0.2_min15"
@@ -106,6 +114,10 @@ def rule_fs(rule):
     return rule.replace(":", "_")
 
 
+def split_cfg(split):
+    return SPLITS[split]["split"], SPLITS[split]["batches"], SPLITS[split]["guard"]
+
+
 def arm_paths(out, arm):
     d = Path(out) / arm
     return {"dir": d, "cache": d / "cache", "soft": d / "soft", "bench": d / "bench",
@@ -155,7 +167,8 @@ def check_runs(runs):
 # --------------------------------------------------------------------------- #
 def step_plan(out, arm, trunk, soft, split, data_path, device, py=sys.executable):
     """Ordered (name, argv, done_check) for one arm."""
-    rng, tag, p = SPLITS[split], split, arm_paths(out, arm)
+    nusplit, rng, guard = split_cfg(split)
+    tag, p = split, arm_paths(out, arm)
     dev = str(device)
     bench = [py, str(MB), "bench", "--cache", str(p["cache"]), "--out", str(p["bench"]),
              "--batches", rng, "--device", dev]
@@ -169,13 +182,14 @@ def step_plan(out, arm, trunk, soft, split, data_path, device, py=sys.executable
 
     return [
         ("cache", lambda: [py, str(MB), "cache", "--checkpoint", str(trunk), "--data-path",
-                           str(data_path), "--out", str(p["cache"]), "--split", "validation",
+                           str(data_path), "--out", str(p["cache"]), "--split", nusplit,
                            "--batches", rng, "--store-hit-x", "--batch-size", "8", "--device", dev],
          lambda: (p["cache"] / "manifest.json").exists()
          and "finished" in json.loads((p["cache"] / "manifest.json").read_text())),
         ("soft", lambda: [py, str(SP), "eval", "--head", str(soft), "--cache", str(p["cache"]),
                           "--batches", rng, "--out", str(p["soft"]), "--tag", tag,
-                          "--decode", "v2", "--no-null", "--merge-thr", "0.5", "--device", dev],
+                          "--decode", "v2", "--no-null", "--merge-thr", "0.5", "--device", dev]
+                         + guard,
          lambda: (p["soft"] / f"{tag}_summary.json").exists()),
         ("seed05", lambda: bench + ["--backends", "seed", "--t-beta", "0.5", "--t-d", "0.3",
                                     "--t-assign", "inf"] + resume_flag(SEED_TAG),
@@ -187,11 +201,12 @@ def step_plan(out, arm, trunk, soft, split, data_path, device, py=sys.executable
                                   "--dbscan-min-samples", "15"] + resume_flag(DB02_TAG),
          bench_done(DB02_TAG)),
         ("headroom", lambda: [py, str(S0), "headroom", "--cache", str(p["cache"]), "--out",
-                              str(p["stage0"]), "--batches", rng, "--rule", RULE, "--device", dev],
+                              str(p["stage0"]), "--batches", rng, "--rule", RULE, "--device", dev]
+                             + guard,
          lambda: (p["stage0"] / f"headroom_events_{rule_fs(RULE)}.csv").exists()),
         ("rules", lambda: [py, str(S0), "rules", "--cache", str(p["cache"]), "--out",
                            str(p["stage0"]), "--batches", rng, "--rules", RULE, "fixed:0.5",
-                           "--device", dev],
+                           "--device", dev] + guard,
          lambda: (p["stage0"] / "rules_events.csv").exists()),
     ]
 
@@ -200,8 +215,14 @@ def cmd_plan(a, execute=False):
     if a.split not in SPLITS:
         raise SystemExit(f"--split must be one of {sorted(SPLITS)}")
     prov = check_runs(a.runs)
+    ref_trunk, ref_head = getattr(a, "ref_trunk", None), getattr(a, "ref_head", None)
+    if bool(ref_trunk) != bool(ref_head):
+        raise SystemExit("--ref-trunk and --ref-head must be given together")
+    if ref_trunk:                       # reported reference, never part of the criteria
+        prov[REF] = {"trunk": str(ref_trunk), "trunk_sha256": sha256(ref_trunk),
+                     "soft": str(ref_head), "soft_sha256": sha256(ref_head), "reference": True}
     out = Path(a.out)
-    arms = a.arms or list(ARMS)
+    arms = a.arms or (list(ARMS) + ([REF] if ref_trunk else []))
     if execute:
         out.mkdir(parents=True, exist_ok=True)
         pfile = out / "provenance.json"
@@ -210,7 +231,8 @@ def cmd_plan(a, execute=False):
                                    or rec["runs"][k]["soft_sha256"] != prov[k]["soft_sha256"]
                                    for k in prov):
             raise SystemExit(f"{pfile}: the trunks/soft layers changed since this evaluation began")
-        rec.update({"split": a.split, "batches": SPLITS[a.split], "runs": prov,
+        rec.update({"split": a.split, "batches": SPLITS[a.split]["batches"],
+                    "nugraph_split": SPLITS[a.split]["split"], "runs": prov,
                     "driver_sha256": sha256(__file__), "tools": {str(t): sha256(t) for t in
                                                                 (SP, S0, MB) if t.exists()},
                     "repo": _git(HERE)})
@@ -415,6 +437,25 @@ def stage1a_reference(data, path):
             "mean": float(d.mean()), "se": float(d.std(ddof=1) / math.sqrt(d.size))}
 
 
+def _mean_on(metric, keys):
+    import numpy as np
+    v = [metric[k] for k in keys if k in metric and math.isfinite(metric[k])]
+    return float(np.mean(v)) if v else NAN
+
+
+def _paired_vs_ref(data, ref_metric, m, keys):
+    """T (mean over seeds) - reference, paired per event (reported, never gating)."""
+    import numpy as np
+    ref = ref_metric
+    ks = sorted(k for k in keys if k in ref and math.isfinite(ref[k])
+                and all(math.isfinite(data[x][m].get(k, NAN)) for x in ("T_s1", "T_s2")))
+    if len(ks) < 2:
+        return {"n": len(ks), "mean": NAN, "se": NAN}
+    d = np.array([0.5 * (data["T_s1"][m][k] + data["T_s2"][m][k]) - ref[k] for k in ks])
+    return {"n": len(ks), "mean": float(d.mean()),
+            "se": float(d.std(ddof=1) / math.sqrt(d.size))}
+
+
 def cost_per_step(runs):
     out = {}
     for arm in ARMS:
@@ -429,9 +470,11 @@ def fmt(x, n=4):
 
 
 def render(res, split):
-    L = [f"# Stage 1b evaluation — {split} ({SPLITS[split]})", ""]
-    if split != "devB":
+    L = [f"# Stage 1b evaluation — {split} ({SPLITS[split]['split']} {SPLITS[split]['batches']})", ""]
+    if split == "smoke":
         L += ["**SMOKE RUN on dev-A: mechanics check only, NOT a decision.**", ""]
+    elif split == "test":
+        L += ["**FINAL pre-registered evaluation on NuGraph's test split (never used before).**", ""]
     ok = lambda b: "PASS" if b else "FAIL"
     g = res["G"]
     L += ["## Decision (pre-registered, design §5.3)", "",
@@ -472,6 +515,13 @@ def render(res, split):
         r = res["stage1a_reference"]
         L += ["", f"T soft output (mean over seeds) {fmt(r['T_soft'])} vs frozen Stage-1a head on the ep29 "
               f"latent {fmt(r['stage1a_frozen'])}: {fmt(r['mean'])} ± {fmt(r['se'])} (n = {r['n']}; reported)"]
+    if res.get("reference_ep29"):
+        L += ["", "## Reference: ep29 trunk (frozen Stage-1a head for 'soft'), same events", "",
+              "| metric | ep29 | T (mean over seeds) | T − ep29 ± SE | n |", "|---|---|---|---|---|"]
+        for m in ("hard", "soft", "seed05", "db03", "db02"):
+            r = res["reference_ep29"][m]
+            L.append(f"| {m} | {fmt(r['mean'])} | {fmt(r['T_mean'])} | {fmt(r['T_minus_ref']['mean'])} ± "
+                     f"{fmt(r['T_minus_ref']['se'])} | {r['T_minus_ref']['n']} |")
     if res.get("cost"):
         L += ["", "Cost per training step (in-step seconds): " + ", ".join(
             f"{a} {fmt(v['step_s_mean'], 2)}" for a, v in res["cost"].items())]
@@ -489,7 +539,17 @@ def cmd_report(a):
         res["stage1a_reference"] = stage1a_reference(data, a.stage1a_events)
     if a.runs:
         res["cost"] = cost_per_step(a.runs)
-    res.update({"split": a.split, "batches": SPLITS[a.split], "decision": a.split == "devB",
+    ref_dir = out / REF
+    if (ref_dir / "soft" / f"{a.split}_events.csv").exists():
+        ref, ref_health = load_arm(out, REF, a.split)
+        keys = set.intersection(*(set(data[x]["soft"]) for x in ARMS))
+        res["reference_ep29"] = {
+            m: {"mean": _mean_on(ref[m], keys), "T_mean": res["paired"][m]["T_mean"],
+                "T_minus_ref": _paired_vs_ref(data, ref[m], m, keys)}
+            for m in ("hard", "soft", "seed05", "db03", "db02")}
+        res["reference_ep29"]["health"] = ref_health
+    res.update({"split": a.split, "batches": SPLITS[a.split]["batches"],
+                "nugraph_split": SPLITS[a.split]["split"], "decision": a.split in ("devB", "test"),
                 "clarifications": CLARIFICATIONS,
                 "generated": time.strftime("%Y-%m-%dT%H:%M:%S")})
     (out / "report.json").write_text(json.dumps(res, indent=2, default=str))
@@ -509,7 +569,10 @@ def main(argv=None):
         s.add_argument("--split", required=True, choices=sorted(SPLITS))
         s.add_argument("--data-path", required=True)
         s.add_argument("--device", default="0")
-        s.add_argument("--arms", nargs="+", choices=ARMS, default=None)
+        s.add_argument("--arms", nargs="+", choices=list(ARMS) + [REF], default=None)
+        s.add_argument("--ref-trunk", default=None,
+                       help="reference trunk (ep29) evaluated alongside; never part of the criteria")
+        s.add_argument("--ref-head", default=None, help="frozen Stage-1a head for the reference arm")
     s = sub.add_parser("report")
     s.add_argument("--out", required=True)
     s.add_argument("--split", required=True, choices=sorted(SPLITS))
