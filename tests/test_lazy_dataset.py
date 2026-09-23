@@ -19,10 +19,16 @@ pytest.importorskip("pynuml")
 ng = pytest.importorskip("nugraph")
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
-ib = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = ib          # pickle resolves classes by module name (DataLoader workers)
-spec.loader.exec_module(ib)
+# Load io_bench once per session and share it. It must be in sys.modules for pickle to resolve the
+# classes defined in it (DataLoader workers pickle the dataset), and registering two *different*
+# module objects under the same name breaks pickle's identity check, so reuse whatever is there.
+if "io_bench" in sys.modules:
+    ib = sys.modules["io_bench"]
+else:
+    _spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
+    ib = importlib.util.module_from_spec(_spec)
+    sys.modules["io_bench"] = ib
+    _spec.loader.exec_module(ib)
 
 
 def tiny_file(path, n=64, hits=7):

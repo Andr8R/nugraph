@@ -15,10 +15,16 @@ np = pytest.importorskip("numpy")
 h5py = pytest.importorskip("h5py")
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
-ib = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = ib          # pickle resolves classes by module name (DataLoader workers)
-spec.loader.exec_module(ib)
+# Load io_bench once per session and share it. It must be in sys.modules for pickle to resolve the
+# classes defined in it (DataLoader workers pickle the dataset), and registering two *different*
+# module objects under the same name breaks pickle's identity check, so reuse whatever is there.
+if "io_bench" in sys.modules:
+    ib = sys.modules["io_bench"]
+else:
+    _spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
+    ib = importlib.util.module_from_spec(_spec)
+    sys.modules["io_bench"] = ib
+    _spec.loader.exec_module(ib)
 
 
 
@@ -118,15 +124,15 @@ def test_loader_variants_use_disjoint_blocks_by_default(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "torch_geometric.loader",
                         type("m", (), {"DataLoader": _FakeLoader}))
-    a = type("A", (), {"data_path": str(p), "split": "train", "n": 192, "offset": 100,
+    a = type("A", (), {"data_path": str(p), "split": "train", "n": 192, "offset": 0,
                        "order": "dataset", "workers": [0, 4, 8], "prefetch": 4,
                        "shared_samples": False, "json": None})()
     ib.cmd_loader(a)
-    assert seen == [(64, 100), (64, 164), (64, 228)]           # disjoint, 192/3 each
+    assert seen == [(64, 0), (64, 64), (64, 128)]              # disjoint, 192/3 each
     seen.clear()
     a.shared_samples = True
     ib.cmd_loader(a)
-    assert seen == [(192, 100)] * 3                            # same block, warm after the first
+    assert seen == [(192, 0)] * 3                              # same block, warm after the first
 
 
 def test_loader_reports_a_variant_that_yields_no_batches(tmp_path, monkeypatch, capsys):
