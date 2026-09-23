@@ -6,6 +6,7 @@ workers can be used at all), and batches are identical whether they are read by 
 workers. Needs h5py + pynuml, so they skip on GPVM.
 """
 import importlib.util
+import sys
 import pickle
 from pathlib import Path
 
@@ -20,6 +21,7 @@ ng = pytest.importorskip("nugraph")
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
 ib = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ib          # pickle resolves classes by module name (DataLoader workers)
 spec.loader.exec_module(ib)
 
 

@@ -221,20 +221,24 @@ def cmd_loader(a):
             first = first if first is not None else times[0]
             t0 = t1
         del it, loader
-        steady = times[1:] or times
-        out["variants"][f"workers={w}"] = {
-            "offset": off, "cold": not a.shared_samples,
-            "batches": len(times), "first_batch_s": first,
-            "mean_s": statistics.fmean(steady), "median_s": statistics.median(steady),
-            "total_s": sum(times)}
-        print(f"  workers={w}: {statistics.median(steady):.3f} s/batch median "
-              f"({statistics.fmean(steady):.3f} mean, first {first:.2f}, {len(times)} batches)", flush=True)
+        steady = times[1:] or times                         # the first batch includes worker startup
+        rec = {"offset": off, "cold": not a.shared_samples, "batches": len(times),
+               "first_batch_s": first, "total_s": sum(times),
+               "mean_s": statistics.fmean(steady) if steady else None,
+               "median_s": statistics.median(steady) if steady else None}
+        out["variants"][f"workers={w}"] = rec
+        if steady:
+            print(f"  workers={w}: {rec['median_s']:.3f} s/batch median "
+                  f"({rec['mean_s']:.3f} mean, first {first:.2f}, {len(times)} batches)", flush=True)
+        else:
+            print(f"  workers={w}: no batches produced (samples {per} < batch size, or a read error)",
+                  flush=True)
     if not a.shared_samples:
         print("  (each worker count read a disjoint, cold block of samples)")
     base = out["variants"].get("workers=0", {}).get("median_s")
     if base:
         for k, v in out["variants"].items():
-            v["speedup_vs_workers0"] = base / v["median_s"] if v["median_s"] else None
+            v["speedup_vs_workers0"] = base / v["median_s"] if v.get("median_s") else None
     print(json.dumps(out, indent=2, default=str))
     if a.json:
         Path(a.json).write_text(json.dumps(out, indent=2, default=str))

@@ -4,6 +4,8 @@ The interesting parts are the sample ordering (must match training) and the lazy
 the mechanism that would let DataLoader workers be used at all. Needs h5py (EAF), so these skip on GPVM.
 """
 import importlib.util
+import json
+import sys
 import pickle
 from pathlib import Path
 
@@ -15,7 +17,20 @@ h5py = pytest.importorskip("h5py")
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("io_bench", ROOT / "scripts/particle_hierarchy/io_bench.py")
 ib = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ib          # pickle resolves classes by module name (DataLoader workers)
 spec.loader.exec_module(ib)
+
+
+
+class _FakeLoader:
+    """Yields objects that quack like a PyG batch (`batch["hit"].num_nodes`)."""
+
+    def __init__(self, *a, batches=2, **k):
+        self.batches = batches
+
+    def __iter__(self):
+        hit = type("store", (), {"num_nodes": 7})()
+        return iter([{"hit": hit} for _ in range(self.batches)])
 
 
 def tiny_file(path, n=40, hits=5):
@@ -101,14 +116,8 @@ def test_loader_variants_use_disjoint_blocks_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(ib, "sample_names", fake_names)
     monkeypatch.setattr(ib, "env_report", lambda *a, **k: {})
 
-    class FakeLoader:
-        def __init__(self, *a, **k):
-            pass
-
-        def __iter__(self):
-            return iter(())
-    monkeypatch.setitem(__import__("sys").modules, "torch_geometric.loader",
-                        type("m", (), {"DataLoader": FakeLoader}))
+    monkeypatch.setitem(sys.modules, "torch_geometric.loader",
+                        type("m", (), {"DataLoader": _FakeLoader}))
     a = type("A", (), {"data_path": str(p), "split": "train", "n": 192, "offset": 100,
                        "order": "dataset", "workers": [0, 4, 8], "prefetch": 4,
                        "shared_samples": False, "json": None})()
@@ -118,6 +127,23 @@ def test_loader_variants_use_disjoint_blocks_by_default(tmp_path, monkeypatch):
     a.shared_samples = True
     ib.cmd_loader(a)
     assert seen == [(192, 100)] * 3                            # same block, warm after the first
+
+
+def test_loader_reports_a_variant_that_yields_no_batches(tmp_path, monkeypatch, capsys):
+    """A loader that produces nothing must be recorded, not crash in the summary statistics."""
+    p = tiny_file(tmp_path / "t.h5", n=200)
+    monkeypatch.setattr(ib, "sample_names", lambda *a, **k: ([f"evt{i:03d}" for i in range(64)], 200))
+    monkeypatch.setattr(ib, "env_report", lambda *a, **k: {})
+    monkeypatch.setitem(sys.modules, "torch_geometric.loader",
+                        type("m", (), {"DataLoader": lambda *a, **k: _FakeLoader(batches=0)}))
+    out = tmp_path / "r.json"
+    a = type("A", (), {"data_path": str(p), "split": "train", "n": 64, "offset": 0,
+                       "order": "dataset", "workers": [0], "prefetch": 2,
+                       "shared_samples": False, "json": str(out)})()
+    ib.cmd_loader(a)                                            # must not raise
+    rec = json.loads(out.read_text())["variants"]["workers=0"]
+    assert rec["batches"] == 0 and rec["mean_s"] is None and rec["median_s"] is None
+    assert "no batches produced" in capsys.readouterr().out
 
 
 def test_loader_refuses_too_few_samples_per_variant(tmp_path):
