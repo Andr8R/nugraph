@@ -345,8 +345,10 @@ class Stage1bLoop(ResumableLoop):
         bs = self.a.batch_size
         order = self.sampler.epoch_order(epoch)
         self.sampler.epoch, self.sampler.skip = epoch, skip * bs
-        loader = DataLoader(self.train_ds, batch_size=bs, num_workers=0, sampler=self.sampler,
-                            drop_last=True, shuffle=False, pin_memory=True)
+        nw = self.a.num_workers
+        extra = dict(persistent_workers=True, prefetch_factor=self.a.prefetch_factor) if nw else {}
+        loader = DataLoader(self.train_ds, batch_size=bs, num_workers=nw, sampler=self.sampler,
+                            drop_last=True, shuffle=False, pin_memory=True, **extra)
         for j, batch in enumerate(loader):
             k = skip + j
             yield order[k * bs:(k + 1) * bs], batch
@@ -508,6 +510,8 @@ def run_config(a, ckpt_sha, head_sha, git):
             "epochs": a.epochs, "batch_size": a.batch_size, "balance_frac": a.balance_frac,
             "limit_train_batches": a.limit_train_batches, "dev_batches": a.dev_batches,
             "no_soft_checkpoint": a.no_soft_checkpoint, "resume_every": a.resume_every,
+            # num_workers / prefetch_factor are deliberately absent: they change who reads the
+            # batches, not which batches, so a run may be resumed with a different loader setting.
             "data_path": str(Path(a.data_path).resolve()), "checkpoint_sha256": ckpt_sha,
             "head_sha256": head_sha, "git_commit": git["git_commit"], "git_dirty": git["git_dirty"],
             "soft_targets": SOFT_TARGETS, "decode": DECODE}
@@ -536,6 +540,10 @@ def main():
     p.add_argument("--limit-train-batches", type=int, default=None, help="smoke tests only")
     p.add_argument("--no-soft-checkpoint", action="store_true",
                    help="disable per-event activation checkpointing of the soft layer")
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="training DataLoader workers (0 = as all runs so far). Batches and their "
+                        "order are identical for any value; only who reads them changes")
+    p.add_argument("--prefetch-factor", type=int, default=2, help="batches prefetched per worker")
     p.add_argument("--resume-every", type=int, default=100, help="steps between resume saves")
     p.add_argument("--resume", action="store_true", help="continue from --out/resume.pt")
     p.add_argument("--crash-at-step", type=int, default=None,
@@ -604,7 +612,9 @@ def main():
                     "layernorm_blocks": sum(hasattr(m, "norm") for m in net.core_net.children()),
                     "dev_events": len(dev_idx), "torch": torch.__version__,
                     "matmul_precision": {"baseline": "highest", "train_and_monitor": "high"},
-                    "training_loop": "explicit loop with exact resume (no Lightning Trainer)"}
+                    "training_loop": "explicit loop with exact resume (no Lightning Trainer)",
+                    "loader": {"num_workers": a.num_workers,
+                               "prefetch_factor": a.prefetch_factor, "pin_memory": True}}
     man_path.write_text(json.dumps(manifest, indent=2, default=str))
 
     if not loop.extra.get("baseline_done"):

@@ -18,8 +18,26 @@ class NuGraphDataset(Dataset):
                  samples: list[str],
                  transform: Optional[Callable] = None):
         super().__init__(transform=transform)
-        self.file = h5py.File(filename)
+        self.filename = filename
+        self._file = None
         self.samples = samples
+
+    @property
+    def file(self) -> h5py.File:
+        """Open the file on first use, once per process.
+
+        Opening lazily (instead of in __init__) is what allows DataLoader workers: the dataset is
+        pickled to each worker, and an open h5py.File cannot be pickled. Each worker then opens its
+        own handle on first access. Samples and their order are unaffected.
+        """
+        if self._file is None:
+            self._file = h5py.File(self.filename)
+        return self._file
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_file"] = None                # never pickle the handle
+        return state
 
     def len(self) -> int:
         return len(self.samples)
