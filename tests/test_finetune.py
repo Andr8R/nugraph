@@ -111,6 +111,64 @@ def test_soft_checkpointing_does_not_change_loss_or_gradients():
     assert torch.allclose(ta[0].grad, tb[0].grad, atol=1e-5)
 
 
+# ---- profiling instrumentation (diagnostic only) -------------------------- #
+def test_profiling_does_not_change_the_loss_or_the_gradients():
+    """The timers must be pure observation: same numbers, same gradients, with and without them."""
+    soft = new_soft()
+    ta, tb = batch_tensors(), batch_tensors()
+    la, na = soft_loss(soft, ta, True)
+    la.sum().backward()
+    ga = [p.grad.clone() for p in soft.parameters()]
+    soft.zero_grad()
+
+    timers, syncs = {}, []
+    ox, beta, hx, fg, y, ysem, ptr = tb
+    lb, nb = ft.soft_loss_from_hits(soft, ox, beta, hx, fg, y, ysem, ptr, True,
+                                    sp.s0.make_rule("fixed1:0.5"), mat, 3, 0.3, float("inf"), DEV,
+                                    timers=timers, sync=lambda: syncs.append(1))
+    lb.sum().backward()
+    assert na == nb == 2
+    assert torch.equal(la.detach(), lb.detach())                      # bitwise, not just close
+    for g1, p in zip(ga, soft.parameters()):
+        assert torch.equal(g1, p.grad)
+    for k in ("ev_inputs", "prepare", "swap_grad_tensors", "soft_fwd", "soft_other"):
+        assert timers[k] >= 0.0, k
+    assert len(syncs) == 2 * 4 + 1                                    # 4 stages x 2 events + close
+
+
+def test_tick_is_inert_without_timers_and_accumulates_with_them():
+    assert ft.tick(None, None, "x", 12.5) == 12.5                     # production path: no-op
+    timers, calls = {}, []
+    t = ft.tick(timers, lambda: calls.append(1), "x", 0.0)
+    assert t > 0 and timers["x"] > 0 and calls == [1]
+    before = timers["x"]
+    ft.tick(timers, None, "x", t)
+    assert timers["x"] > before                                       # same key accumulates
+
+
+def test_profile_row_accounts_for_every_second_of_the_step():
+    row = ft.profile_row(7, 1, {"nugraph_fwd": 0.5, "backward": 1.0}, 2.0,
+                         {"n_events": 32, "n_soft_events": 30})
+    assert row["global_step"] == 7 and row["epoch"] == 1 and row["n_events"] == 32
+    for k in ft.PROFILE_STAGES:
+        assert f"t_{k}_s" in row                                      # a stable column set
+    assert row["t_prepare_s"] == 0.0
+    assert row["t_unattributed_s"] == pytest.approx(0.5)              # 2.0 - (0.5 + 1.0)
+
+
+def test_profile_steps_is_not_part_of_the_resume_identity(tmp_path):
+    """Profiling changes who is watching, not what is computed, so it must not block a resume."""
+    a = type("A", (), {k: v for k, v in dict(
+        arm="T", seed=1, lam=1.0, lr=1e-4, head_lr=1e-3, epochs=5, batch_size=32,
+        balance_frac=0.1, limit_train_batches=None, dev_batches="0:2", no_soft_checkpoint=False,
+        resume_every=100, data_path=str(tmp_path / "d.h5"), num_workers=4, prefetch_factor=2,
+        profile_steps=100).items()})()
+    cfg = ft.run_config(a, "sha", "hsha", {"git_commit": "c", "git_dirty": False})
+    assert "profile_steps" not in cfg and "num_workers" not in cfg
+    a.profile_steps = 0
+    assert ft.run_config(a, "sha", "hsha", {"git_commit": "c", "git_dirty": False}) == cfg
+
+
 def test_seeded_sampler_order_is_a_pure_function_of_seed_and_epoch():
     sizes = np.arange(1, 201)
     s1 = ft.seeded_balance_sampler(sizes, 8, 0.1, seed=1)

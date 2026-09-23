@@ -261,6 +261,34 @@ class ResumableLoop:
 # --------------------------------------------------------------------------- #
 # soft loss on a NuGraph batch
 # --------------------------------------------------------------------------- #
+def tick(timers, sync, key, t0):
+    """Accumulate elapsed time into timers[key]; no-op when timers is None (production path).
+
+    Diagnostic only: when profiling, `sync` forces the device to finish so a stage's time is its own.
+    The syncs make a profiled step slightly SLOWER than a normal one, so profiled steps must not be
+    used for throughput numbers -- only for the breakdown.
+    """
+    if timers is None:
+        return t0
+    if sync:
+        sync()
+    t1 = time.perf_counter()
+    timers[key] = timers.get(key, 0.0) + (t1 - t0)
+    return t1
+
+
+PROFILE_STAGES = ("to_device", "nugraph_fwd", "ev_inputs", "prepare", "swap_grad_tensors",
+                  "soft_fwd", "soft_other", "backward", "optimizer")
+
+
+def profile_row(global_step, epoch, timers, step_total, extras):
+    """One diagnostic row: every stage, the unattributed remainder, and the step total."""
+    row = {"global_step": global_step, "epoch": epoch, "step_total_s": step_total,
+           **{f"t_{k}_s": timers.get(k, 0.0) for k in PROFILE_STAGES}, **extras}
+    row["t_unattributed_s"] = step_total - sum(timers.get(k, 0.0) for k in PROFILE_STAGES)
+    return row
+
+
 def event_inputs(ox, beta, hx, fg, y_i, y_sem, s, g):
     """Detached CPU copy of one event in the cache's layout (what Stage 1a trained on)."""
     mask = fg[s].detach().cpu()
@@ -270,7 +298,7 @@ def event_inputs(ox, beta, hx, fg, y_i, y_sem, s, g):
 
 
 def soft_loss_from_hits(soft, ox, beta, hx, fg, y_i, y_sem, ptr, grad_to_trunk, rule_fn, mat,
-                        M, t_d, t_assign, dev, checkpoint=True):
+                        M, t_d, t_assign, dev, checkpoint=True, timers=None, sync=None):
     """Mean over the batch's usable events of the Stage-1a (membership, existence, merge) losses.
 
     grad_to_trunk=False (arm C): the soft layer only sees detached copies, so the loss gives the
@@ -281,15 +309,19 @@ def soft_loss_from_hits(soft, ox, beta, hx, fg, y_i, y_sem, ptr, grad_to_trunk, 
     from torch.utils.checkpoint import checkpoint as ckpt
     terms = []
     bounds = ptr.tolist()
+    t0 = time.perf_counter()
     for g in range(len(bounds) - 1):
         s = slice(bounds[g], bounds[g + 1])
-        d = sp.prepare(event_inputs(ox, beta, hx, fg, y_i, y_sem, s, g), mat, rule_fn, M, t_d,
-                       t_assign, dev)
+        ev = event_inputs(ox, beta, hx, fg, y_i, y_sem, s, g)
+        t0 = tick(timers, sync, "ev_inputs", t0)
+        d = sp.prepare(ev, mat, rule_fn, M, t_d, t_assign, dev)
+        t0 = tick(timers, sync, "prepare", t0)
         if d is None:
             continue
         if grad_to_trunk:
             fgi = d["fg_idx"].to(ox.device)
             d["hit_x"], d["ox"], d["beta"] = hx[s][fgi], ox[s][fgi], beta[s][fgi]
+        t0 = tick(timers, sync, "swap_grad_tensors", t0)
 
         def fn(hit_x, oxx, bb, d=d):
             dd = dict(d)
@@ -298,9 +330,12 @@ def soft_loss_from_hits(soft, ox, beta, hx, fg, y_i, y_sem, ptr, grad_to_trunk, 
 
         args = (d["hit_x"], d["ox"], d["beta"])
         terms.append(ckpt(fn, *args, use_reentrant=False) if checkpoint else fn(*args))
+        t0 = tick(timers, sync, "soft_fwd", t0)
     if not terms:
         return torch.zeros(3, device=dev), 0
-    return torch.stack(terms).mean(0), len(terms)
+    out = torch.stack(terms).mean(0), len(terms)
+    tick(timers, sync, "soft_other", t0)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +369,7 @@ class Stage1bLoop(ResumableLoop):
         self.rule_fn = s0.make_rule(head_cfg["rule"])
         self.M, self.t_d, self.t_assign = head_cfg["m"], head_cfg["t_d"], head_cfg["t_assign"]
         self.sampler = seeded_balance_sampler(datasize, a.batch_size, a.balance_frac, a.seed)
+        self.prof_rows = []
         self.optimizer = torch.optim.AdamW([{"params": net.parameters(), "lr": a.lr},
                                             {"params": soft.parameters(), "lr": a.head_lr}])
 
@@ -353,33 +389,72 @@ class Stage1bLoop(ResumableLoop):
             k = skip + j
             yield order[k * bs:(k + 1) * bs], batch
 
-    def _soft(self, batch, grad_to_trunk):
+    def _soft(self, batch, grad_to_trunk, timers=None, sync=None):
         h = batch["hit"]
         return soft_loss_from_hits(self.soft, h.ox, h.of, h.x, mb.foreground_mask(h), batch.y_i(),
                                    h.y_semantic, h.ptr, grad_to_trunk, self.rule_fn, self.mat,
                                    self.M, self.t_d, self.t_assign, self.dev,
-                                   checkpoint=not self.a.no_soft_checkpoint)
+                                   checkpoint=not self.a.no_soft_checkpoint,
+                                   timers=timers, sync=sync)
 
     def step(self, batch):
         import torch
+        prof = self.st["global_step"] < (self.a.profile_steps or 0)
+        timers = {} if prof else None
+        sync = ((lambda: torch.cuda.synchronize(self.dev))
+                if prof and self.dev.type == "cuda" else None)
+        t_step = time.perf_counter()
+        t0 = t_step
         self.net.train()
         self.soft.train()
         batch = batch.to(self.dev)
+        t0 = tick(timers, sync, "to_device", t0)
         self.optimizer.zero_grad(set_to_none=True)
         loss_ng, _ = self.net(batch, "train")
-        terms, n_soft = self._soft(batch, self.a.arm == "T")
+        t0 = tick(timers, sync, "nugraph_fwd", t0)
+        terms, n_soft = self._soft(batch, self.a.arm == "T", timers=timers, sync=sync)
+        t0 = time.perf_counter() if prof else t0          # soft stages timed inside
         soft_loss = terms.sum()
         loss = loss_ng + self.a.lam * soft_loss
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {self.st['global_step']}: "
                                f"nugraph {float(loss_ng)}, soft {terms.tolist()}")
         loss.backward()
+        t0 = tick(timers, sync, "backward", t0)
         torch.nn.utils.clip_grad_norm_(self.soft.parameters(), 1.0)       # soft layer only
         self.optimizer.step()
+        t0 = tick(timers, sync, "optimizer", t0)
+        if prof:
+            self.prof_rows.append(profile_row(
+                self.st["global_step"], self.st["epoch"], timers,
+                time.perf_counter() - t_step,
+                {"n_events": int(batch.num_graphs), "n_soft_events": n_soft,
+                 "n_hits": int(batch["hit"].num_nodes),
+                 "soft_checkpoint": not self.a.no_soft_checkpoint}))
+            mb.write_rows(self.out / "profile.csv", self.prof_rows)
+            if len(self.prof_rows) == self.a.profile_steps:
+                self.print_profile()
         return {"loss": float(loss.detach()), "loss_ng": float(loss_ng.detach()),
                 "soft": float(soft_loss.detach()), "mem": float(terms[0].detach()),
                 "exist": float(terms[1].detach()), "merge": float(terms[2].detach()),
                 "events": float(batch.num_graphs), "soft_events": float(n_soft)}
+
+    def print_profile(self):
+        """Mean seconds per stage over the profiled steps (diagnostic; syncs included)."""
+        import numpy as np
+        rows = self.prof_rows
+        tot = float(np.mean([r["step_total_s"] for r in rows]))
+        print(f"\n[profile] {len(rows)} steps, mean step {tot:.3f} s (with per-stage syncs; a normal "
+              f"step is slightly faster). Mean seconds per step:", flush=True)
+        for k in PROFILE_STAGES + ("unattributed",):
+            key = f"t_{k}_s"
+            v = float(np.mean([r.get(key, 0.0) for r in rows]))
+            print(f"[profile]   {k:20s} {v:7.3f} s  ({100 * v / tot:5.1f} %)", flush=True)
+        ev = float(np.mean([r["n_soft_events"] for r in rows]))
+        soft = sum(float(np.mean([r[f"t_{k}_s"] for r in rows]))
+                   for k in ("ev_inputs", "prepare", "swap_grad_tensors", "soft_fwd", "soft_other"))
+        print(f"[profile]   soft-layer forward total {soft:.3f} s over {ev:.1f} events "
+              f"= {1e3 * soft / max(ev, 1):.1f} ms/event; wrote {self.out}/profile.csv\n", flush=True)
 
     # ---- dev-A monitoring ----
     def validate(self, epoch):
@@ -510,6 +585,7 @@ def run_config(a, ckpt_sha, head_sha, git):
             "epochs": a.epochs, "batch_size": a.batch_size, "balance_frac": a.balance_frac,
             "limit_train_batches": a.limit_train_batches, "dev_batches": a.dev_batches,
             "no_soft_checkpoint": a.no_soft_checkpoint, "resume_every": a.resume_every,
+            # profile_steps is likewise absent: it only adds timers and device syncs.
             # num_workers / prefetch_factor are deliberately absent: they change who reads the
             # batches, not which batches, so a run may be resumed with a different loader setting.
             "data_path": str(Path(a.data_path).resolve()), "checkpoint_sha256": ckpt_sha,
@@ -544,6 +620,10 @@ def main():
                    help="training DataLoader workers (0 = as all runs so far). Batches and their "
                         "order are identical for any value; only who reads them changes")
     p.add_argument("--prefetch-factor", type=int, default=2, help="batches prefetched per worker")
+    p.add_argument("--profile-steps", type=int, default=0,
+                   help="diagnostic: record a per-stage timing breakdown for the first N steps into "
+                        "profile.csv. Adds device syncs, so those steps are slightly slower and must "
+                        "not be used for throughput; the maths and the data order are unchanged")
     p.add_argument("--resume-every", type=int, default=100, help="steps between resume saves")
     p.add_argument("--resume", action="store_true", help="continue from --out/resume.pt")
     p.add_argument("--crash-at-step", type=int, default=None,
@@ -614,7 +694,8 @@ def main():
                     "matmul_precision": {"baseline": "highest", "train_and_monitor": "high"},
                     "training_loop": "explicit loop with exact resume (no Lightning Trainer)",
                     "loader": {"num_workers": a.num_workers,
-                               "prefetch_factor": a.prefetch_factor, "pin_memory": True}}
+                               "prefetch_factor": a.prefetch_factor, "pin_memory": True},
+                    "profile_steps": a.profile_steps}
     man_path.write_text(json.dumps(manifest, indent=2, default=str))
 
     if not loop.extra.get("baseline_done"):
