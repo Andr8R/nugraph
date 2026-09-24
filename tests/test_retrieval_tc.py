@@ -123,10 +123,43 @@ def test_nan_against_a_number_is_a_mismatch():
     assert rt.same_value(0.2, 0.2 + 1e-12) and not rt.same_value(0.2, 0.2 + 1e-6)
 
 
-def test_a_missing_event_fails_event_identity(tmp_path):
+def test_a_missing_event_that_carries_values_fails(tmp_path):
+    """Dropping a real event from one run leaves it carrying values in the others: G2 must fail."""
     root, s1b = build(tmp_path, drop_event=("C", 2, 20, 17))
     res = rt.evaluate(root, s1b)
-    assert any(f.startswith("G2 C_s2_m20") for f in res["gates"]["failures"])
+    assert any(f.startswith("G2 ") and "carry values" in f for f in res["gates"]["failures"])
+
+
+def _blank_event(path, key):
+    rows = list(csv.DictReader(open(path)))
+    for r in rows:
+        if (int(r["batch"]), int(r["event"])) == key:
+            r.update(ari_particle="nan", completeness="nan", purity="nan", pick_own=0, own_in_nb=0, pop=0)
+    write_events(path, rows)
+
+
+def test_a_trunk_skipped_empty_event_is_excluded_not_failed(tmp_path):
+    """The real case: an event with no population hits is skipped by one trunk (empty predicted
+    foreground). It carries nothing anywhere, so it is excluded and every number is unchanged."""
+    root, s1b = build(tmp_path)
+    ref = rt.evaluate(root, s1b)
+    key = (2, 1)                                                     # event index 17
+    for a in rt.ARMS:
+        for t in rt.TRUNK_SEEDS:
+            _blank_event(s1b / f"{a}_s{t}" / "soft" / "devB_events.csv", key)
+            for m in rt.MS:
+                _blank_event(root / "eval" / rt.run_name(a, t, m) / "devB_events.csv", key)
+    for m in rt.MS:                                                  # T_s2 skips it entirely
+        p = root / "eval" / rt.run_name("T", 2, m) / "devB_events.csv"
+        write_events(p, [r for r in csv.DictReader(open(p)) if (int(r["batch"]), int(r["event"])) != key])
+    p = s1b / "T_s2" / "soft" / "devB_events.csv"
+    write_events(p, [r for r in csv.DictReader(open(p)) if (int(r["batch"]), int(r["event"])) != key])
+    res = rt.evaluate(root, s1b)
+    assert res["gates"]["pass"], res["gates"]["failures"]
+    assert res["gates"]["excluded_noncontributing"]["T_s1_m5"] == 1
+    assert res["gates"]["excluded_noncontributing"]["T_s2_m5"] == 0
+    blanked = rt.evaluate(root, s1b)["interaction"]["ari"]["combined"]
+    assert blanked[0] == pytest.approx(ref["interaction"]["ari"]["combined"][0], abs=5e-4)
 
 
 def test_a_head_off_the_registered_recipe_fails(tmp_path):

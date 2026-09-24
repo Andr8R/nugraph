@@ -153,6 +153,12 @@ def same_value(x, y, tol=1e-9):
     return abs(x - y) <= tol
 
 
+def contributes(row):
+    """True if an event would enter any estimand: a finite metric or any population hit."""
+    return (any(math.isfinite(row[k]) for k in ("ari", "comp", "pur", "own"))
+            or any(row[k] > 0 for k in ("pop", "pick_own", "own_in_nb") if math.isfinite(row[k])))
+
+
 def check_gates(root, ev, s1b_devb):
     """G1 heads as registered; G2 every run on the same events; G3 hard seed == Stage-1b dev-B."""
     fails = []
@@ -172,11 +178,17 @@ def check_gates(root, ev, s1b_devb):
                     fails.append(f"G1 {run_name(a, t, m)}: {bad}")
                 if f"cache_train_{a}_s{t}" not in str(meta.get("train_cache", "")):
                     fails.append(f"G1 {run_name(a, t, m)}: train cache {meta.get('train_cache')}")
-    sets = {n: set(r) for n, r in ev.items()}
-    ref = next(iter(sets.values()))
-    for n, s in sets.items():
-        if s != ref:
-            fails.append(f"G2 {n}: {len(s ^ ref)} events differ from the other runs")
+    # G2 (amended 2026-09-25, see retrieval_tc.md): an event is skipped when the trunk's predicted
+    # foreground is empty or yields no candidate, which is trunk-dependent. Such events may be absent
+    # from some runs, but only if they carry nothing in any run where they do appear; the analysis is
+    # paired on the intersection (the Stage-1b convention). Same-cache identity is G3's job.
+    common = set.intersection(*(set(r) for r in ev.values()))
+    for n, r in ev.items():
+        extra = set(r) - common
+        contrib = sorted(k for k in extra if contributes(r[k]))
+        if contrib:
+            fails.append(f"G2 {n}: {len(contrib)} events outside the common set carry values, "
+                         f"first {contrib[0]}")
     for a in ARMS:
         for t in TRUNK_SEEDS:
             p = Path(s1b_devb) / f"{a}_s{t}" / "soft" / f"{TAG}_events.csv"
@@ -217,7 +229,11 @@ def evaluate(root, s1b_devb):
                     raise SystemExit(f"missing {p}")
                 ev[run_name(a, t, m)] = load_events(p)
     fails = check_gates(root, ev, s1b_devb)
-    res = {"gates": {"pass": not fails, "failures": fails}, "runs": {}, "interaction": {},
+    common = set.intersection(*(set(r) for r in ev.values()))
+    excluded = {n: len(set(r) - common) for n, r in ev.items()}
+    ev = {n: {k: r[k] for k in common} for n, r in ev.items()}      # every number on the same events
+    res = {"gates": {"pass": not fails, "failures": fails, "n_common": len(common),
+                     "excluded_noncontributing": excluded}, "runs": {}, "interaction": {},
            "widening": {}, "t_minus_c": {}, "kappa": {}, "hit_weighted_own": {}}
     for n, r in ev.items():
         res["runs"][n] = {k: mean_se([x[k] for x in r.values()])[0] for k in METRICS}
@@ -289,7 +305,8 @@ def fmt(ms):
 
 def render(res):
     L = ["# Stage 1a-R2 — T/C latent × M=20 (dev-B, pre-registered)", "",
-         f"**Gates:** {'PASS' if res['gates']['pass'] else 'FAIL'}"]
+         f"**Gates:** {'PASS' if res['gates']['pass'] else 'FAIL'} — {res['gates']['n_common']} common "
+         f"events; excluded non-contributing: {res['gates']['excluded_noncontributing']}"]
     L += [f"- {f}" for f in res["gates"]["failures"]]
     L += ["", f"**Verdict:** {res['verdict']}", "",
           "## Interaction (T20 − T5) − (C20 − C5), per-event paired", "",
