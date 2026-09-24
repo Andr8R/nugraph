@@ -163,6 +163,12 @@ def cmd_cache(a):
     loader = {"train": nudata.train_dataloader, "validation": nudata.val_dataloader,
               "test": nudata.test_dataloader}[a.split]()
     lo, hi = parse_range(a.batches)
+    if a.sampler_seed is not None:
+        # BalanceSampler draws its (train) order from numpy's global RNG when iteration starts,
+        # so seeding here makes the cached event set and order a pure function of the seed.
+        # Unseeded (the default, as before) every train cache is a different random subset.
+        import numpy as np
+        np.random.seed(a.sampler_seed)
     manifest = {"checkpoint": a.checkpoint, "checkpoint_sha256": sha256(a.checkpoint),
                 "repo": str(repo), "git_commit": commit, "tree_clean": not diff,
                 "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
@@ -170,6 +176,7 @@ def cmd_cache(a):
                 "data_path": a.data_path, "split": a.split, "batch_size": a.batch_size,
                 "batches": a.batches, "limit_events": a.limit_events,
                 "store_hit_x": a.store_hit_x, "shuffle": "balance",
+                "sampler_seed": a.sampler_seed,
                 "torch": torch.__version__,
                 "gpu": torch.cuda.get_device_name(dev),
                 "hparams": {k: hp[k] for k in ("in_features", "coord_features",
@@ -836,6 +843,9 @@ def main():
     s.add_argument("--store-hit-x", action="store_true",
                    help="also store foreground hit embeddings (float16) for Stage-1 training")
     s.add_argument("--shard-events", type=int, default=400)
+    s.add_argument("--sampler-seed", type=int, default=None,
+                   help="seed numpy before iterating, so a train-split cache holds the same events "
+                        "in the same order for every checkpoint (default: unseeded, as before)")
     s.add_argument("--allow-dirty", action="store_true")
     s.set_defaults(fn=cmd_cache)
 
