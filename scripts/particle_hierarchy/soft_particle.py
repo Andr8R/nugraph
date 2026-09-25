@@ -682,15 +682,50 @@ def to_store(d):
 
 
 CLASS_BUCKETS = 8                   # 7 semantic classes + "unlabelled" (y_sem < 0)
-CLASS_MODES = ("none", "zeros", "oracle")
+CLASS_MODES = ("none", "zeros", "oracle", "pred")
+SEMANTIC_KEYS = ("semantic_decoder.net.weight", "semantic_decoder.net.bias")
+DIFFUSE = 6
+_READOUT = {}
 
 
-def class_channels(d, mode):
+def semantic_readout(cache):
+    """(W, b, sha256) of the semantic head of the checkpoint that produced `cache`.
+
+    NuGraph3's semantic head is one Linear on h.x, and the cache stores h.x of foreground hits, so the
+    trunk's predicted class logits are exactly W @ hit_x + b. The checkpoint is verified against the
+    cache manifest's checkpoint_sha256 (loaded once per process).
+    """
+    import torch
+    man = json.loads((Path(cache) / "manifest.json").read_text())
+    ckpt, want = man["checkpoint"], man["checkpoint_sha256"]
+    if ckpt not in _READOUT:
+        got = mb.sha256(ckpt)
+        if got != want:
+            raise SystemExit(f"{ckpt}: sha256 {got} != cache manifest {want}")
+        sd = torch.load(ckpt, map_location="cpu", weights_only=False)["state_dict"]
+        _READOUT[ckpt] = (sd[SEMANTIC_KEYS[0]].float(), sd[SEMANTIC_KEYS[1]].float(), got)
+    return _READOUT[ckpt]
+
+
+def _manifest_sha(cache):
+    """checkpoint_sha256 recorded in a cache manifest (None if the cache has no manifest, e.g. tests)."""
+    p = Path(cache) / "manifest.json"
+    return json.loads(p.read_text()).get("checkpoint_sha256") if p.exists() else None
+
+
+def predicted_logits(hit_x, readout):
+    W, b, _ = readout
+    return hit_x.float() @ W.to(hit_x.device).T + b.to(hit_x.device)
+
+
+def class_channels(d, mode, readout=None):
     """Extra per-hit input channels for the class-information probe (Stage 1a-R5).
 
     zeros  -- CTRL arm: the channels exist (same architecture, same init draws) but carry nothing.
     oracle -- ORACLE UPPER BOUND, not deployable: one-hot of each foreground hit's TRUE semantic
               class; candidates inherit their seed hit's class through the candidate encoder.
+    pred   -- deployable (Stage 1a-R6): softmax of the trunk's own semantic logits, recomputed from the
+              cached hit embedding (`readout` = semantic_readout(cache)), plus a zero 8th channel.
     """
     import torch
     n = d["fg_idx"].numel()
@@ -701,16 +736,23 @@ def class_channels(d, mode):
         ys = d["y_sem"][d["fg_idx"].cpu()].long()
         ys = torch.where(ys < 0, torch.full_like(ys, CLASS_BUCKETS - 1), ys)
         return torch.nn.functional.one_hot(ys, CLASS_BUCKETS).to(device=dev, dtype=d["hit_x"].dtype)
+    if mode == "pred":
+        if readout is None:
+            raise ValueError("class_channels('pred') needs the cache's semantic read-out")
+        p = predicted_logits(d["hit_x"], readout).softmax(dim=1)
+        pad = torch.zeros(n, CLASS_BUCKETS - p.size(1), device=dev, dtype=p.dtype)
+        return torch.cat([p, pad], dim=1).to(d["hit_x"].dtype)
     raise ValueError(f"unknown class_channels mode {mode!r}")
 
 
 def iter_events(cache, lo, hi, mat, rule_fn, a, dev, need_hit_x=True, store=False):
     mode = getattr(a, "class_channels", "none")
+    readout = semantic_readout(cache) if mode == "pred" else None
     for ev in mb.iter_cache(cache, lo, hi):
         d = prepare(ev, mat, rule_fn, a.m, a.t_d, a.t_assign, dev, need_hit_x)
         if d is not None:
             if mode != "none":
-                d["hit_x"] = torch_cat(d["hit_x"], class_channels(d, mode))
+                d["hit_x"] = torch_cat(d["hit_x"], class_channels(d, mode, readout))
             yield to_store(d) if store else d
 
 
@@ -741,6 +783,9 @@ def cmd_train(a):
     import torch
     mat, dev = _setup(a)
     rule_fn = s0.make_rule(a.rule)
+    if a.class_channels == "pred" and a.dev_cache:
+        if _manifest_sha(a.train_cache) is None or _manifest_sha(a.train_cache) != _manifest_sha(a.dev_cache):
+            raise SystemExit("pred class channels need train and dev caches from the same checkpoint")
     torch.manual_seed(a.seed)
     train = list(iter_events(a.train_cache, *mb.parse_range(a.train_batches), mat, rule_fn, a,
                              dev, store=True))
@@ -768,6 +813,7 @@ def cmd_train(a):
            "merge_scope": a.merge_scope, "dist_only": a.dist_only, "decode": a.decode,
            "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above",
            "class_channels": a.class_channels, "oracle_upper_bound": a.class_channels == "oracle",
+           "latent_checkpoint_sha256": _manifest_sha(a.train_cache),
            "init_sha256": init_sha, "perm_sha256": []}
     hist, best, best_epoch = [], -math.inf, None
     for epoch in range(a.epochs):
@@ -916,6 +962,41 @@ def cmd_diagnose(a):
               f"{v['no_cluster_all_dead']:6.3f} {v['pop_unassigned']:7.3f}")
     print(json.dumps(res["heads"], indent=2))
     print(f"wrote {out}/diagnose_summary.json")
+
+
+def cmd_readout_check(a):
+    """Gate P0 (Stage 1a-R6): does the read-out recomputed from the fp16 cached embedding reproduce the
+    cache's foreground definition (argmax != diffuse, computed in fp32 at cache time)?"""
+    import torch
+    readout = semantic_readout(a.cache)
+    lo, hi = mb.parse_range(a.batches)
+    n_fg = n_diffuse = n_pop = n_pop_ok = 0
+    per_class = {}
+    for ev in mb.iter_cache(a.cache, lo, hi):
+        fg = ev["mask"].bool()
+        if not bool(fg.any()):
+            continue
+        pred = predicted_logits(ev["hit_x_fg"], readout).argmax(dim=1)
+        n_fg += int(fg.sum())
+        n_diffuse += int((pred == DIFFUSE).sum())
+        ys, yi = ev["y_sem"].long()[fg], ev["y_i"].long()[fg]
+        pop = (ys >= 0) & (yi >= 0)
+        n_pop += int(pop.sum())
+        n_pop_ok += int((pred[pop] == ys[pop]).sum())
+        for c in torch.unique(ys[pop]).tolist():
+            sel = pop & (ys == c)
+            acc = per_class.setdefault(int(c), [0, 0])
+            acc[0] += int(sel.sum()); acc[1] += int((pred[sel] == c).sum())
+    res = {"cache": a.cache, "batches": a.batches, "checkpoint_sha256": readout[2],
+           "n_fg": n_fg, "fg_reclassified_diffuse": n_diffuse / max(n_fg, 1),
+           "pop_accuracy": n_pop_ok / max(n_pop, 1),
+           "pop_recall_by_class": {c: v[1] / max(v[0], 1) for c, v in sorted(per_class.items())},
+           "pass": n_diffuse / max(n_fg, 1) <= 1e-3}
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(res, indent=2))
+    print(json.dumps(res, indent=2))
+    if not res["pass"]:
+        raise SystemExit("P0 FAIL: the recomputed read-out does not reproduce the cached foreground mask")
 
 
 def cmd_time(a):
@@ -1191,12 +1272,18 @@ def main():
     s.add_argument("--exist-target", choices=["real", "primary"], default="real")
     s.add_argument("--merge-scope", choices=["local", "all"], default="local")
     s.add_argument("--class-channels", choices=CLASS_MODES, default="none",
-                   help="Stage 1a-R5 class probe: 'zeros' = matched control (same architecture, no "
-                        "information), 'oracle' = TRUE semantic class one-hot (ORACLE UPPER BOUND, not "
-                        "deployable)")
+                   help="class probes: 'zeros' = matched control (same architecture, no information), "
+                        "'oracle' = TRUE semantic class one-hot (ORACLE UPPER BOUND, not deployable, "
+                        "R5), 'pred' = the trunk's own semantic probabilities recomputed from hit_x (R6)")
     s.add_argument("--dist-only", action="store_true",
                    help="ablation: membership from latent distance + existence only (no pair_net)")
     s.set_defaults(fn=cmd_train)
+
+    s = sub.add_parser("readout-check")
+    s.add_argument("--cache", required=True)
+    s.add_argument("--batches", default="0:")
+    s.add_argument("--out", required=True)
+    s.set_defaults(fn=cmd_readout_check)
 
     s = sub.add_parser("eval"); common(s)
     s.add_argument("--head", required=True)

@@ -42,7 +42,8 @@ def first_true(flags):
     return np.where(any_, flags.argmax(axis=1) + 1, 0)
 
 
-def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, ks=KS):
+def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, ks=KS,
+                  hit_pcls=None, cand_pcls=None):
     """One event's labels, ARIs and hit-level counts.
 
     W (n, m) membership probabilities over the hit's m candidates (columns in distance order);
@@ -50,6 +51,8 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
     hit; owner (n,) canonical candidate of the hit's particle (-1 none); cand_pid / cand_cls (K,)
     particle id / true class of each candidate's seed hit; hit_cls (n,) true class of each hit;
     ari_fn(labels over these n hits) -> particle ARI of the event.
+    hit_pcls / cand_pcls (optional, Stage 1a-R6): the trunk's PREDICTED class of each hit / of each
+    candidate's seed hit; adds the addressability split of the different-class misses.
     """
     import numpy as np
     n, m = W.shape
@@ -93,6 +96,11 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
         "err_same_class": int(((pid >= 0) & (ccls == hit_cls[miss])).sum()),
         "err_diff_class": int(((pid >= 0) & (ccls != hit_cls[miss])).sum()),
     }
+    if hit_pcls is not None:
+        diff = (pid >= 0) & (ccls != hit_cls[miss])
+        same_pred = cand_pcls[picked] == hit_pcls[miss]
+        st["err_diff_pred_same"] = int((diff & same_pred).sum())     # trunk-confused
+        st["err_diff_pred_diff"] = int((diff & ~same_pred).sum())    # addressable by predicted class
     return ev, st, labels
 
 
@@ -146,6 +154,7 @@ def cmd_run(a):
     if cfg["m"] != 20:
         raise SystemExit(f"registered for M=20 heads; this head has m={cfg['m']}")
     model = sp.load_head(ck, dev)
+    readout = sp.semantic_readout(a.cache) if a.pred_class else None
     rows, total, r1_fail, r3_fail = [], {}, [], []
     for d in sp.iter_events(a.cache, lo, hi, mat, sp.s0.make_rule(cfg["rule"]), a, dev):
         with torch.no_grad():
@@ -163,11 +172,16 @@ def cmd_run(a):
             return sp.mb.event_quality(lab, yi, ysem, keep).get("ari_particle", math.nan)
 
         cand_hit = fg_idx.cpu()[d["cp"].cpu()]
+        pc = {}
+        if a.pred_class:
+            emb = d["hit_x"][:, :readout[0].shape[1]]                # original h.x, not probe channels
+            hp = sp.predicted_logits(emb, readout).argmax(dim=1).cpu().numpy()
+            pc = {"hit_pcls": hp, "cand_pcls": hp[d["cp"].cpu().numpy()]}
         ev, st, labels = analyse_event(
             W.cpu().numpy(), d["nb"].cpu().numpy(), d["own"].cpu().numpy(), pop.cpu().numpy(),
             np.where(d["own"].any(dim=1).cpu().numpy(), d["correct"].cpu().numpy(), -1),
             d["seed_true"].cpu().numpy(), ysem[cand_hit].cpu().numpy(), ysem[fg_idx.cpu()].cpu().numpy(),
-            ari_fn)
+            ari_fn, **pc)
         key = (int(d["batch"]), int(d["event"]))
         if not same_partition(labels["pick_only"].tolist(), ref_fg.cpu().tolist()):
             r1_fail.append(key)
@@ -365,6 +379,8 @@ def main():
     s.add_argument("--batches", default="0:150")
     s.add_argument("--deva-end", type=int, default=150)
     s.add_argument("--device", default="0")
+    s.add_argument("--pred-class", action="store_true",
+                   help="also split different-class misses by the trunk's predicted classes (R6)")
     s.set_defaults(fn=cmd_run)
     s = sub.add_parser("report")
     s.add_argument("--rank-root", required=True, help="dir with one subdir per head tag")
