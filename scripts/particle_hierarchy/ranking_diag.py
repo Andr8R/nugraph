@@ -142,8 +142,7 @@ def cmd_run(a):
     mat, dev = sp._setup(a)
     ck = torch.load(a.head, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
-    for k in ("rule", "m", "r", "t_d", "t_assign"):
-        setattr(a, k, cfg[k])
+    sp.apply_head_cfg(a, cfg)
     if cfg["m"] != 20:
         raise SystemExit(f"registered for M=20 heads; this head has m={cfg['m']}")
     model = sp.load_head(ck, dev)

@@ -681,14 +681,63 @@ def to_store(d):
     return out
 
 
+CLASS_BUCKETS = 8                   # 7 semantic classes + "unlabelled" (y_sem < 0)
+CLASS_MODES = ("none", "zeros", "oracle")
+
+
+def class_channels(d, mode):
+    """Extra per-hit input channels for the class-information probe (Stage 1a-R5).
+
+    zeros  -- CTRL arm: the channels exist (same architecture, same init draws) but carry nothing.
+    oracle -- ORACLE UPPER BOUND, not deployable: one-hot of each foreground hit's TRUE semantic
+              class; candidates inherit their seed hit's class through the candidate encoder.
+    """
+    import torch
+    n = d["fg_idx"].numel()
+    dev = d["hit_x"].device
+    if mode == "zeros":
+        return torch.zeros(n, CLASS_BUCKETS, device=dev, dtype=d["hit_x"].dtype)
+    if mode == "oracle":
+        ys = d["y_sem"][d["fg_idx"].cpu()].long()
+        ys = torch.where(ys < 0, torch.full_like(ys, CLASS_BUCKETS - 1), ys)
+        return torch.nn.functional.one_hot(ys, CLASS_BUCKETS).to(device=dev, dtype=d["hit_x"].dtype)
+    raise ValueError(f"unknown class_channels mode {mode!r}")
+
+
 def iter_events(cache, lo, hi, mat, rule_fn, a, dev, need_hit_x=True, store=False):
+    mode = getattr(a, "class_channels", "none")
     for ev in mb.iter_cache(cache, lo, hi):
         d = prepare(ev, mat, rule_fn, a.m, a.t_d, a.t_assign, dev, need_hit_x)
         if d is not None:
+            if mode != "none":
+                d["hit_x"] = torch_cat(d["hit_x"], class_channels(d, mode))
             yield to_store(d) if store else d
 
 
+def torch_cat(x, y):
+    import torch
+    return torch.cat([x, y], dim=1)
+
+
+def apply_head_cfg(a, cfg):
+    """Everything a tool must take from a trained head's config to rebuild its inputs exactly."""
+    for k in ("rule", "m", "r", "t_d", "t_assign"):
+        setattr(a, k, cfg[k])
+    a.class_channels = cfg.get("class_channels", "none")
+
+
+def state_sha256(model):
+    """Hash of every parameter/buffer, in key order (initialisation identity check)."""
+    import hashlib
+    h = hashlib.sha256()
+    for k, v in sorted(model.state_dict().items()):
+        h.update(k.encode())
+        h.update(v.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
 def cmd_train(a):
+    import hashlib
     import torch
     mat, dev = _setup(a)
     rule_fn = s0.make_rule(a.rule)
@@ -699,6 +748,10 @@ def cmd_train(a):
     if not train:
         raise SystemExit("no usable training events")
     model = build_model(train[0]["hit_x"].size(1), train[0]["ox"].size(1), a.width, a.r).to(dev)
+    init_sha = state_sha256(model)
+    if a.class_channels == "oracle":
+        print("  *** ORACLE UPPER BOUND: the head sees TRUE semantic classes; not a deployable model ***",
+              flush=True)
     gb = sum(v.numel() * v.element_size() for d in train for v in d.values()
              if hasattr(v, "numel")) / 1e9
     print(f"  cached training tensors: {gb:.2f} GB (CPU)", flush=True)
@@ -713,11 +766,14 @@ def cmd_train(a):
            "train_cache": a.train_cache, "train_batches": a.train_batches,
            "n_train_events": len(train), "target": a.target, "exist_target": a.exist_target,
            "merge_scope": a.merge_scope, "dist_only": a.dist_only, "decode": a.decode,
-           "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above"}
+           "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above",
+           "class_channels": a.class_channels, "oracle_upper_bound": a.class_channels == "oracle",
+           "init_sha256": init_sha, "perm_sha256": []}
     hist, best, best_epoch = [], -math.inf, None
     for epoch in range(a.epochs):
         model.train()
         perm = torch.randperm(len(train))
+        cfg["perm_sha256"].append(hashlib.sha256(perm.numpy().tobytes()).hexdigest())
         tot, parts, n = 0.0, {"mem": 0.0, "exist": 0.0, "merge": 0.0}, 0
         opt.zero_grad()
         for j, i in enumerate(perm.tolist()):
@@ -808,8 +864,7 @@ def cmd_eval(a):
     mat, dev = _setup(a)
     ck = torch.load(a.head, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
-    for k in ("rule", "m", "r", "t_d", "t_assign"):
-        setattr(a, k if k != "r" else "r", cfg[k])
+    apply_head_cfg(a, cfg)
     lo, hi = mb.parse_range(a.batches)
     if (hi is None or hi > a.heldout_start) and not a.allow_heldout:
         raise SystemExit(f"--batches {a.batches} reaches the held-out set; use a development "
@@ -837,8 +892,7 @@ def cmd_diagnose(a):
     mat, dev = _setup(a)
     ck = torch.load(a.head, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
-    for k in ("rule", "m", "r", "t_d", "t_assign"):
-        setattr(a, k, cfg[k])
+    apply_head_cfg(a, cfg)
     model = load_head(ck, dev)
     stats, rows = {}, []
     t0 = time.perf_counter()
@@ -888,8 +942,9 @@ def cmd_time(a):
     sync = (lambda: torch.cuda.synchronize(dev)) if cuda else (lambda: None)
     ck = torch.load(a.head, map_location=dev, weights_only=False)
     cfg = ck["cfg"]
-    for k in ("rule", "m", "r", "t_d", "t_assign"):
-        setattr(a, k, cfg[k])
+    apply_head_cfg(a, cfg)
+    if a.class_channels != "none":
+        raise SystemExit("time: class-probe heads are diagnostic (oracle / control) and not timed")
     model = load_head(ck, dev)
     rule_fn = s0.make_rule(cfg["rule"])
     kw = decode_kwargs(a)
@@ -1135,6 +1190,10 @@ def main():
     s.add_argument("--target", choices=["own", "primary"], default="own")
     s.add_argument("--exist-target", choices=["real", "primary"], default="real")
     s.add_argument("--merge-scope", choices=["local", "all"], default="local")
+    s.add_argument("--class-channels", choices=CLASS_MODES, default="none",
+                   help="Stage 1a-R5 class probe: 'zeros' = matched control (same architecture, no "
+                        "information), 'oracle' = TRUE semantic class one-hot (ORACLE UPPER BOUND, not "
+                        "deployable)")
     s.add_argument("--dist-only", action="store_true",
                    help="ablation: membership from latent distance + existence only (no pair_net)")
     s.set_defaults(fn=cmd_train)
