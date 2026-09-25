@@ -56,6 +56,7 @@ def _load(name, path):
 
 
 sp = _load("soft_particle", HERE / "soft_particle.py")
+sc = _load("sem_consistency", HERE / "sem_consistency.py")
 mb, s0 = sp.mb, sp.s0
 NAN = float("nan")
 SOFT_TARGETS = dict(target="own", exist_target="real", merge_scope="local")
@@ -295,6 +296,8 @@ def validate_profile_args(a):
                              "flows into the trunk, so the split double-counts the trunk backward)")
         if not a.profile_steps:
             raise SystemExit("--profile-split-backward needs --profile-steps N")
+        if getattr(a, "sem_cons", 0.0):
+            raise SystemExit("--profile-split-backward does not backward the --sem-cons term; not allowed together")
 
 
 def profile_row(global_step, epoch, timers, step_total, extras):
@@ -432,6 +435,11 @@ class Stage1bLoop(ResumableLoop):
         t0 = time.perf_counter() if prof else t0          # soft stages timed inside
         soft_loss = terms.sum()
         loss = loss_ng + self.a.lam * soft_loss
+        cons = None
+        if self.a.sem_cons:                      # Stage 1a-R7: within-particle semantic consistency
+            h = batch["hit"]
+            cons = sc.sem_consistency_loss(h.x_semantic, batch.y_i(), h.y_semantic, h.batch)
+            loss = loss + self.a.sem_cons * cons
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {self.st['global_step']}: "
                                f"nugraph {float(loss_ng)}, soft {terms.tolist()}")
@@ -459,7 +467,8 @@ class Stage1bLoop(ResumableLoop):
         return {"loss": float(loss.detach()), "loss_ng": float(loss_ng.detach()),
                 "soft": float(soft_loss.detach()), "mem": float(terms[0].detach()),
                 "exist": float(terms[1].detach()), "merge": float(terms[2].detach()),
-                "events": float(batch.num_graphs), "soft_events": float(n_soft)}
+                "events": float(batch.num_graphs), "soft_events": float(n_soft),
+                **({"cons": float(cons.detach())} if cons is not None else {})}
 
     def print_profile(self):
         """Mean seconds per stage over the profiled steps (diagnostic; syncs included)."""
@@ -485,10 +494,15 @@ class Stage1bLoop(ResumableLoop):
         self.net.eval()
         self.soft.eval()
         metrics, graphs, rows = {}, 0, []
+        sem = [0.0, 0.0, 0, 0]                   # disagreeing pairs, pairs, labelled hits, correct
         with torch.no_grad():
             for bi, batch in enumerate(self.dev_loader):
                 batch = batch.to(self.dev)
                 loss_ng, m = self.net(batch, "val")
+                hs = batch["hit"]
+                for i, v in enumerate(sc.pair_counts_torch(hs.x_semantic.argmax(dim=1), batch.y_i(),
+                                                           hs.y_semantic, hs.batch)):
+                    sem[i] += v
                 ng = batch.num_graphs
                 graphs += ng
                 for k, v in {"loss/val": loss_ng, **m}.items():
@@ -535,6 +549,8 @@ class Stage1bLoop(ResumableLoop):
                                           if dl.size > 1 else NAN),
                "dev/pred_true_med": float(np.nanmedian(ratio)),
                "dev/no_cluster": float(np.mean(g_("n_groups") == 0)),
+               "dev_sem/pair_disagree": sem[0] / sem[1] if sem[1] else NAN,
+               "dev_sem/acc": sem[3] / sem[2] if sem[2] else NAN,
                **{f"dev_ng/{k}": v / max(graphs, 1) for k, v in metrics.items()}}
         return row, rows
 
@@ -544,7 +560,7 @@ class Stage1bLoop(ResumableLoop):
         mb.write_rows(self.out / f"dev_events_ep{epoch}.csv", rows)
         print(f"[{self.a.arm} s{self.a.seed}] epoch {epoch}: " + "  ".join(
             f"{k} {v:.4f}" for k, v in row.items()
-            if isinstance(v, float) and (k.startswith(("dev/", "train/", "gpu_"))
+            if isinstance(v, float) and (k.startswith(("dev/", "dev_sem/", "train/", "gpu_"))
                                          or k in ("dev_ng/semantic/recall-val",
                                                   "dev_ng/event/recall-val", "dev_ng/loss/val"))),
             flush=True)
@@ -560,7 +576,7 @@ class Stage1bLoop(ResumableLoop):
         row, rows = self.validate(epoch)
         n = max(self.tr.get("n", 0), 1)
         row.update({f"train/{k}": self.tr.get(k, 0.0) / n
-                    for k in ("loss", "loss_ng", "soft", "mem", "exist", "merge")})
+                    for k in ("loss", "loss_ng", "soft", "mem", "exist", "merge", "cons") if k in self.tr})
         row.update({"train/steps": self.tr.get("n", 0), "train/events": self.tr.get("events", 0),
                     "train/soft_events": self.tr.get("soft_events", 0),
                     "global_step": self.st["global_step"]})
@@ -607,6 +623,7 @@ def run_config(a, ckpt_sha, head_sha, git):
             "epochs": a.epochs, "batch_size": a.batch_size, "balance_frac": a.balance_frac,
             "limit_train_batches": a.limit_train_batches, "dev_batches": a.dev_batches,
             "no_soft_checkpoint": a.no_soft_checkpoint, "resume_every": a.resume_every,
+            "sem_cons": a.sem_cons,
             # profile_steps is likewise absent: it only adds timers and device syncs.
             # num_workers / prefetch_factor are deliberately absent: they change who reads the
             # batches, not which batches, so a run may be resumed with a different loader setting.
@@ -631,6 +648,9 @@ def main():
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--lam", type=float, default=1.0)
+    p.add_argument("--sem-cons", type=float, default=0.0,
+                   help="Stage 1a-R7: weight of the within-particle semantic-consistency loss "
+                        "KL(sg(particle-mean p) || p_hit) on the trunk's semantic predictions (0 = off)")
     p.add_argument("--lr", type=float, default=1e-4, help="trunk (as the ep29 run)")
     p.add_argument("--head-lr", type=float, default=1e-3, help="soft layer (as Stage 1a)")
     p.add_argument("--batch-size", type=int, default=32)

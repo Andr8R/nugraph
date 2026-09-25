@@ -182,6 +182,23 @@ def test_split_backward_is_exact_when_the_graphs_are_disjoint():
         assert torch.equal(g1, g2)
 
 
+def test_sem_cons_is_part_of_the_resume_identity(tmp_path):
+    """Stage 1a-R7: the consistency weight changes training, so a run cannot be resumed under another."""
+    base = dict(arm="C", seed=1, lam=1.0, lr=1e-4, head_lr=1e-3, epochs=5, batch_size=32, balance_frac=0.1,
+                limit_train_batches=None, dev_batches="0:150", no_soft_checkpoint=True, resume_every=100,
+                data_path=str(tmp_path / "d.h5"), sem_cons=0.0)
+    mk = lambda **o: type("A", (), {**base, **o})()
+    git = {"git_commit": "c", "git_dirty": False}
+    assert ft.run_config(mk(), "s", "h", git)["sem_cons"] == 0.0
+    assert ft.run_config(mk(sem_cons=1.0), "s", "h", git) != ft.run_config(mk(), "s", "h", git)
+
+
+def test_split_backward_is_refused_with_sem_cons():
+    a = type("A", (), {"profile_split_backward": True, "arm": "C", "profile_steps": 50, "sem_cons": 1.0})()
+    with pytest.raises(SystemExit, match="sem-cons"):
+        ft.validate_profile_args(a)
+
+
 def test_split_backward_is_refused_outside_arm_c():
     a = type("A", (), {"profile_split_backward": True, "arm": "T", "profile_steps": 50})()
     with pytest.raises(SystemExit, match="requires --arm C"):
@@ -201,7 +218,7 @@ def test_profile_steps_is_not_part_of_the_resume_identity(tmp_path):
         arm="T", seed=1, lam=1.0, lr=1e-4, head_lr=1e-3, epochs=5, batch_size=32,
         balance_frac=0.1, limit_train_batches=None, dev_batches="0:2", no_soft_checkpoint=False,
         resume_every=100, data_path=str(tmp_path / "d.h5"), num_workers=4, prefetch_factor=2,
-        profile_steps=100, profile_split_backward=False).items()})()
+        profile_steps=100, profile_split_backward=False, sem_cons=0.0).items()})()
     cfg = ft.run_config(a, "sha", "hsha", {"git_commit": "c", "git_dirty": False})
     for k in ("profile_steps", "profile_split_backward", "num_workers", "prefetch_factor"):
         assert k not in cfg, k
