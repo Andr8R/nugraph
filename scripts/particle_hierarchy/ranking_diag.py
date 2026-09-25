@@ -21,6 +21,7 @@ KS = (1, 2, 3, 5, 10, 20)
 RANK_BINS = ((2, 2), (3, 3), (4, 5), (6, 10), (11, 20))
 N_CONF = 200                                # histogram bins for p1 and margin on [0, 1]
 LOW_MARGIN = 0.1
+N_CLS = 7                                   # semantic classes (population hits have y_sem in 0..6)
 HEADS = ("ep29_s1", "ep29_s2", "T_s1", "T_s2", "C_s1", "C_s2")
 EP29_DIAG = {"ep29_s1": "retrieval/diag_m20_s1", "ep29_s2": "retrieval/diag_m20_s2"}
 # R1/R2 compare two separate GPU forward passes; a near-tie argmax can flip between them (seen once in
@@ -101,6 +102,20 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
         same_pred = cand_pcls[picked] == hit_pcls[miss]
         st["err_diff_pred_same"] = int((diff & same_pred).sum())     # trunk-confused
         st["err_diff_pred_diff"] = int((diff & ~same_pred).sum())    # addressable by predicted class
+        # predicted-class disagreement between a hit and the candidate it picked, on CORRECT picks too:
+        # a link-rejection signal is only useful if it fires more on wrong links than on right ones
+        dis = hit_pcls != cand_pcls[top1]
+        hit_wrong = hit_pcls != hit_cls                              # the trunk misclassifies the hit
+        st["ok_pred_diff"] = int((ok & dis).sum())
+        st["miss_pred_diff"] = int((miss & dis).sum())
+        st["err_same_pred_diff"] = int(((pid >= 0) & (ccls == hit_cls[miss]) & ~same_pred).sum())
+        st["err_spurious_pred_diff"] = int(((pid < 0) & ~same_pred).sum())
+        st["ok_hit_mispredicted"] = int((ok & hit_wrong).sum())
+        st["miss_hit_mispredicted"] = int((miss & hit_wrong).sum())
+        st["ok_dis_hit_mispredicted"] = int((ok & dis & hit_wrong).sum())
+        for tag, sel in (("ok", ok), ("miss", miss)):                # by the hit's TRUE class
+            st[f"{tag}_by_cls"] = [int((sel & (hit_cls == c)).sum()) for c in range(N_CLS)]
+            st[f"{tag}_dis_by_cls"] = [int((sel & dis & (hit_cls == c)).sum()) for c in range(N_CLS)]
     return ev, st, labels
 
 
