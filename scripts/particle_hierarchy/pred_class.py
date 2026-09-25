@@ -169,11 +169,11 @@ def render(res):
           f"| Δ PRED (deployable) | {cell(1, f'last:{PRIMARY}:PRED')} | {cell(2, f'last:{PRIMARY}:PRED')} |",
           "| **F** [95 % bootstrap] | " + " | ".join(
               f"**{f4(S[t]['F']['F'])}** [{f4(S[t]['F']['ci95'][0])}, {f4(S[t]['F']['ci95'][1])}]" for t in SEEDS) + " |",
-          "| ARI CTRL / PRED / ORACLE | " + " | ".join(
+          f"| ARI {' / '.join(ARMS)} | " + " | ".join(
               " / ".join(f4(S[t][f"last:{PRIMARY}:{a}:ari"]) for a in ARMS) for t in SEEDS) + " |",
           f"| Δ PRED pick_only | {cell(1, 'last:pick_only:PRED')} | {cell(2, 'last:pick_only:PRED')} |",
           f"| Δ PRED best epoch (secondary) | {cell(1, f'best:{PRIMARY}:PRED')} | {cell(2, f'best:{PRIMARY}:PRED')} |",
-          "", "## Mechanism (ranking_diag, CPU): CTRL / PRED / ORACLE", "", "| | seed 1 | seed 2 |", "|---|---|---|"]
+          "", f"## Mechanism (ranking_diag, CPU): {' / '.join(ARMS)}", "", "| | seed 1 | seed 2 |", "|---|---|---|"]
     for k, lab in (("diff_class", "different-class share of misses"), ("same_class", "same-class share"),
                    ("spurious", "spurious share"), ("own_pick", "absolute own-pick"), ("recall1", "owner recall@1"),
                    ("closure2", "closure@2"), ("closure3", "closure@3")):

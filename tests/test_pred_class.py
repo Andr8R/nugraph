@@ -142,6 +142,23 @@ def test_planted_deployable(tmp_path):
     assert "Recovered fraction" in pc.render(res)
 
 
+def test_rendered_arm_labels_follow_the_data_order(tmp_path):
+    """Regression: the tables once said CTRL / PRED / ORACLE while the values were CTRL / ORACLE / PRED."""
+    res = pc.evaluate(*build(tmp_path, g_oracle=0.17, g_pred=0.0))
+    md = pc.render(res)
+    ari_row = next(l for l in md.splitlines() if l.startswith("| ARI "))
+    label = ari_row.split("|")[1].strip()[len("ARI "):].split(" / ")
+    vals = [float(x) for x in ari_row.split("|")[2].split(" / ")]
+    by_arm = dict(zip(label, vals))
+    assert label == list(pc.ARMS)
+    assert by_arm["ORACLE"] > by_arm["CTRL"] + 0.1 and abs(by_arm["PRED"] - by_arm["CTRL"]) < 0.02
+    mech_hdr = next(l for l in md.splitlines() if l.startswith("## Mechanism"))
+    assert mech_hdr.endswith(" / ".join(pc.ARMS))
+    row = next(l for l in md.splitlines() if l.startswith("| different-class share"))
+    shares = dict(zip(pc.ARMS, (float(x) for x in row.split("|")[2].split(" / "))))
+    assert shares["ORACLE"] < shares["CTRL"] and shares["PRED"] == pytest.approx(shares["CTRL"], abs=0.2)
+
+
 def test_planted_trunk_limited(tmp_path):
     v = pc.evaluate(*build(tmp_path, g_pred=0.01))["verdict"]
     assert v["reading"] == "TRUNK-LIMITED" and "trunk-level semantic" in v["next"]
