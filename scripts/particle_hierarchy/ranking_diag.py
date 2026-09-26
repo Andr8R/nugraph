@@ -116,6 +116,32 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
         for tag, sel in (("ok", ok), ("miss", miss)):                # by the hit's TRUE class
             st[f"{tag}_by_cls"] = [int((sel & (hit_cls == c)).sum()) for c in range(N_CLS)]
             st[f"{tag}_dis_by_cls"] = [int((sel & dis & (hit_cls == c)).sum()) for c in range(N_CLS)]
+        # Stage 1a-R7 Step 1: who did the trunk get wrong on each different-class miss?
+        # cand_cls = TRUE class of a candidate's seed hit, cand_pcls = its PREDICTED class.
+        hc, hp = hit_cls[miss], hit_pcls[miss]
+        cc, cpk = ccls, cand_pcls[picked]
+        dm = (pid >= 0) & (cc != hc)                                 # different-class misses
+        hw, cw = hp != hc, cpk != cc                                 # hit / picked seed mispredicted
+        cells = {"cand_disguised": ~hw & cw & (cpk == hc),           # seed predicted AS the hit's class
+                 "hit_disguised": hw & ~cw & (hp == cc),             # hit predicted AS the candidate's class
+                 "both_correct": ~hw & ~cw,                          # trunk separates them; head linked anyway
+                 "both_wrong": hw & cw,
+                 "seed_wrong_third": ~hw & cw & (cpk != hc),
+                 "hit_wrong_third": hw & ~cw & (hp != cc)}
+        for k, m in cells.items():
+            st[f"dm_{k}"] = int((dm & m).sum())
+            st[f"dm_{k}_by_cls"] = [int((dm & m & (hc == c)).sum()) for c in range(N_CLS)]
+        st["dm_by_cls"] = [int((dm & (hc == c)).sum()) for c in range(N_CLS)]
+        # owner side: is the CORRECT candidate's seed mispredicted (so the owner looks foreign)?
+        # on a miss: the first own candidate in the head's ranking; on a correct pick: the picked one
+        owner_col = np.take_along_axis(order_h, np.clip(rank_h - 1, 0, None)[:, None], axis=1)[:, 0]
+        owner = nb[rows, owner_col]
+        seed_wrong = cand_pcls != cand_cls
+        st["miss_owner_seed_wrong"] = int((miss & seed_wrong[owner]).sum())
+        st["ok_owner_seed_wrong"] = int((ok & seed_wrong[top1]).sum())
+        for tag, sel, cand in (("miss", miss, owner), ("ok", ok, top1)):
+            st[f"{tag}_owner_seed_wrong_by_cls"] = [int((sel & seed_wrong[cand] & (hit_cls == c)).sum())
+                                                    for c in range(N_CLS)]
     return ev, st, labels
 
 
