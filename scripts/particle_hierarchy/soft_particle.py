@@ -94,6 +94,9 @@ def build_model(hit_dim, lat_dim, width, R, cfg=None):
             self.log_temp = nn.Parameter(torch.zeros(1))
             self.dist_only = False        # ablation switch
             self.overlap = "dense"        # merge overlap Σ_i w_ia·w_ib: "dense" (Stage 1a) | "sparse"
+            # Stage 1a-R8: the last 2k hit_x columns are [hit block (k) | candidate block (k)]; hit_net never sees
+            # the candidate block, cand_net never sees the hit block. 0 = no split (every earlier head).
+            self.split_k = 0
 
         def logits(self, h, c, ox, cen, nb, e):
             """Membership logits (n_hit, M+1): last column is the null option."""
@@ -109,11 +112,21 @@ def build_model(hit_dim, lat_dim, width, R, cfg=None):
                 lg = self.pair_net(feat).squeeze(-1) + geo
             return torch.cat([lg, self.null_net(h)], dim=1)
 
+        def encode(self, hit_x, ox, beta, seed_idx):
+            """Initial hit and candidate embeddings (with the R8 block isolation when split_k > 0)."""
+            hin = torch.cat([hit_x, ox, beta[:, None]], dim=1)
+            k = self.split_k
+            if not k:
+                return self.hit_net(hin), self.cand_net(hin[seed_idx])
+            F = hit_x.size(1)
+            hit_in, cand_in = hin.clone(), hin[seed_idx].clone()
+            hit_in[:, F - k:F] = 0                       # hit encoder: no candidate block
+            cand_in[:, F - 2 * k:F - k] = 0              # candidate encoder: no hit block
+            return self.hit_net(hit_in), self.cand_net(cand_in)
+
         def forward(self, hit_x, ox, beta, seed_idx, nb):
             """hit_x (n,F) ox (n,lat) beta (n,) seed_idx (K,) nb (n,M) candidate indices."""
-            hin = torch.cat([hit_x, ox, beta[:, None]], dim=1)
-            h = self.hit_net(hin)
-            c = self.cand_net(hin[seed_idx])
+            h, c = self.encode(hit_x, ox, beta, seed_idx)
             cen = ox[seed_idx].clone()
             e = self.exist_net(c).squeeze(-1)
             for _ in range(max(1, self.R)):
@@ -682,7 +695,11 @@ def to_store(d):
 
 
 CLASS_BUCKETS = 8                   # 7 semantic classes + "unlabelled" (y_sem < 0)
-CLASS_MODES = ("none", "zeros", "oracle", "pred")
+CLASS_MODES = ("none", "zeros", "oracle", "pred",
+               "s_zeros", "s_oracle", "s_oracle_seed", "s_oracle_hit", "s_pred_hard")    # s_*: R8 split blocks
+SPLIT_MODES = {  # (hit block, candidate block): None = zeros, "true" = true one-hot, "hard" = argmax one-hot
+    "s_zeros": (None, None), "s_oracle": ("true", "true"), "s_oracle_seed": (None, "true"),
+    "s_oracle_hit": ("true", None), "s_pred_hard": ("hard", "hard")}
 SEMANTIC_KEYS = ("semantic_decoder.net.weight", "semantic_decoder.net.bias")
 DIFFUSE = 6
 _READOUT = {}
@@ -736,6 +753,8 @@ def class_channels(d, mode, readout=None):
         ys = d["y_sem"][d["fg_idx"].cpu()].long()
         ys = torch.where(ys < 0, torch.full_like(ys, CLASS_BUCKETS - 1), ys)
         return torch.nn.functional.one_hot(ys, CLASS_BUCKETS).to(device=dev, dtype=d["hit_x"].dtype)
+    if mode in SPLIT_MODES:
+        return split_channels(d, mode, readout)
     if mode == "pred":
         if readout is None:
             raise ValueError("class_channels('pred') needs the cache's semantic read-out")
@@ -745,9 +764,40 @@ def class_channels(d, mode, readout=None):
     raise ValueError(f"unknown class_channels mode {mode!r}")
 
 
+def split_channels(d, mode, readout=None):
+    """Stage 1a-R8: 16 channels = [hit block (8) | candidate block (8)].
+
+    The candidate block is filled on SEED rows only (cand_net reads only those; hit_net never sees the block), so
+    ORACLE-SEED gives truth to the candidate encoder alone. PRED-HARD is the one-hot of the trunk's argmax — a hardened
+    function of h.x, no new information.
+    """
+    import torch
+    n, k = d["fg_idx"].numel(), CLASS_BUCKETS
+    dev, dt = d["hit_x"].device, d["hit_x"].dtype
+    hit_spec, cand_spec = SPLIT_MODES[mode]
+
+    def block(spec):
+        if spec is None:
+            return torch.zeros(n, k, device=dev, dtype=dt)
+        if spec == "true":
+            ys = d["y_sem"][d["fg_idx"].cpu()].long()
+            ys = torch.where(ys < 0, torch.full_like(ys, k - 1), ys)
+        else:
+            if readout is None:
+                raise ValueError("s_pred_hard needs the cache's semantic read-out")
+            ys = predicted_logits(d["hit_x"], readout).argmax(dim=1).cpu()
+        return torch.nn.functional.one_hot(ys, k).to(device=dev, dtype=dt)
+
+    hb, cb = block(hit_spec), block(cand_spec)
+    seed = torch.zeros(n, dtype=torch.bool, device=dev)
+    seed[d["cp"].to(dev)] = True
+    cb = cb * seed[:, None].to(dt)
+    return torch.cat([hb, cb], dim=1)
+
+
 def iter_events(cache, lo, hi, mat, rule_fn, a, dev, need_hit_x=True, store=False):
     mode = getattr(a, "class_channels", "none")
-    readout = semantic_readout(cache) if mode == "pred" else None
+    readout = semantic_readout(cache) if mode in ("pred", "s_pred_hard") else None
     for ev in mb.iter_cache(cache, lo, hi):
         d = prepare(ev, mat, rule_fn, a.m, a.t_d, a.t_assign, dev, need_hit_x)
         if d is not None:
@@ -783,7 +833,7 @@ def cmd_train(a):
     import torch
     mat, dev = _setup(a)
     rule_fn = s0.make_rule(a.rule)
-    if a.class_channels == "pred" and a.dev_cache:
+    if a.class_channels in ("pred", "s_pred_hard") and a.dev_cache:
         if _manifest_sha(a.train_cache) is None or _manifest_sha(a.train_cache) != _manifest_sha(a.dev_cache):
             raise SystemExit("pred class channels need train and dev caches from the same checkpoint")
     torch.manual_seed(a.seed)
@@ -793,8 +843,10 @@ def cmd_train(a):
     if not train:
         raise SystemExit("no usable training events")
     model = build_model(train[0]["hit_x"].size(1), train[0]["ox"].size(1), a.width, a.r).to(dev)
+    if a.class_channels in SPLIT_MODES:
+        model.split_k = CLASS_BUCKETS
     init_sha = state_sha256(model)
-    if a.class_channels == "oracle":
+    if "oracle" in a.class_channels:
         print("  *** ORACLE UPPER BOUND: the head sees TRUE semantic classes; not a deployable model ***",
               flush=True)
     gb = sum(v.numel() * v.element_size() for d in train for v in d.values()
@@ -812,9 +864,10 @@ def cmd_train(a):
            "n_train_events": len(train), "target": a.target, "exist_target": a.exist_target,
            "merge_scope": a.merge_scope, "dist_only": a.dist_only, "decode": a.decode,
            "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above",
-           "class_channels": a.class_channels, "oracle_upper_bound": a.class_channels == "oracle",
+           "class_channels": a.class_channels, "oracle_upper_bound": "oracle" in a.class_channels,
            "latent_checkpoint_sha256": _manifest_sha(a.train_cache),
-           "init_sha256": init_sha, "perm_sha256": []}
+           "init_sha256": init_sha, "perm_sha256": [],
+           "split_channels": CLASS_BUCKETS if a.class_channels in SPLIT_MODES else 0}
     hist, best, best_epoch = [], -math.inf, None
     for epoch in range(a.epochs):
         model.train()
@@ -925,6 +978,7 @@ def load_head(ck, dev):
     model.load_state_dict(ck["state_dict"])
     model.dist_only = bool(cfg.get("dist_only", False))
     model.overlap = cfg.get("overlap", "dense")
+    model.split_k = int(cfg.get("split_channels", 0))
     model.eval()
     return model
 

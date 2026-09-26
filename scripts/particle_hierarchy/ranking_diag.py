@@ -138,6 +138,14 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
         owner = nb[rows, owner_col]
         seed_wrong = cand_pcls != cand_cls
         st["miss_owner_seed_wrong"] = int((miss & seed_wrong[owner]).sum())
+        # Stage 1a-R8 geometry counters: inside each cell, is the owner's seed mispredicted, and is the picked
+        # candidate nearer in the latent than the owner (columns of nb are in distance order)?
+        osw = seed_wrong[owner[miss]]
+        nearer = order_h[miss, 0] < owner_col[miss]
+        for k, m in cells.items():
+            st[f"dm_{k}_owner_seed_wrong"] = int((dm & m & osw).sum())
+            st[f"dm_{k}_picked_nearer"] = int((dm & m & nearer).sum())
+            st[f"dm_{k}_nearer_owner_seed_ok"] = int((dm & m & nearer & ~osw).sum())
         st["ok_owner_seed_wrong"] = int((ok & seed_wrong[top1]).sum())
         for tag, sel, cand in (("miss", miss, owner), ("ok", ok, top1)):
             st[f"{tag}_owner_seed_wrong_by_cls"] = [int((sel & seed_wrong[cand] & (hit_cls == c)).sum())
