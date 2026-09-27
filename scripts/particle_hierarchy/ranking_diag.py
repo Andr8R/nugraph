@@ -22,6 +22,7 @@ RANK_BINS = ((2, 2), (3, 3), (4, 5), (6, 10), (11, 20))
 N_CONF = 200                                # histogram bins for p1 and margin on [0, 1]
 LOW_MARGIN = 0.1
 N_CLS = 7                                   # semantic classes (population hits have y_sem in 0..6)
+TRACK = (0, 1, 2, 3)                        # pion, muon, kaon, hadron (Stage 1a-R9 FIXTRACK)
 HEADS = ("ep29_s1", "ep29_s2", "T_s1", "T_s2", "C_s1", "C_s2")
 EP29_DIAG = {"ep29_s1": "retrieval/diag_m20_s1", "ep29_s2": "retrieval/diag_m20_s2"}
 # R1/R2 compare two separate GPU forward passes; a near-tie argmax can flip between them (seen once in
@@ -43,8 +44,18 @@ def first_true(flags):
     return np.where(any_, flags.argmax(axis=1) + 1, 0)
 
 
+def pair_counts(part, lab):
+    """(same-particle hit pairs, of which with equal `lab`) over hits with particle ids `part`."""
+    import numpy as np
+    if part.size < 2:
+        return 0, 0
+    _, pc = np.unique(part, return_counts=True)
+    _, kc = np.unique(np.stack([part, lab], axis=1), axis=0, return_counts=True)
+    return int((pc * (pc - 1) // 2).sum()), int((kc * (kc - 1) // 2).sum())
+
+
 def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, ks=KS,
-                  hit_pcls=None, cand_pcls=None):
+                  hit_pcls=None, cand_pcls=None, hit_pid=None, chan_cls=None):
     """One event's labels, ARIs and hit-level counts.
 
     W (n, m) membership probabilities over the hit's m candidates (columns in distance order);
@@ -54,6 +65,9 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
     ari_fn(labels over these n hits) -> particle ARI of the event.
     hit_pcls / cand_pcls (optional, Stage 1a-R6): the trunk's PREDICTED class of each hit / of each
     candidate's seed hit; adds the addressability split of the different-class misses.
+    hit_pid (optional, Stage 1a-R9): true particle id of each hit; adds same-particle co-assignment of the picked
+    candidate among available and among unavailable population hits. chan_cls (optional, with hit_pcls): the
+    class each hit's probe channels carry; adds the channel construction counters.
     """
     import numpy as np
     n, m = W.shape
@@ -97,6 +111,21 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
         "err_same_class": int(((pid >= 0) & (ccls == hit_cls[miss])).sum()),
         "err_diff_class": int(((pid >= 0) & (ccls != hit_cls[miss])).sum()),
     }
+    if hit_pid is not None:
+        for tag, sel in (("avail", avail), ("unavail", pop & ~avail)):
+            st[f"coassign_{tag}_pairs"], st[f"coassign_{tag}_same"] = pair_counts(hit_pid[sel], top1[sel])
+    if hit_pcls is not None and chan_cls is not None:
+        err = pop & (hit_pcls != hit_cls)
+        track = np.isin(hit_cls, TRACK)
+        fixed = err & (chan_cls == hit_cls)
+        st["ch_n"] = int(pop.sum())
+        st["ch_correct"] = int((pop & (chan_cls == hit_cls)).sum())
+        st["trunk_correct"] = int((pop & (hit_pcls == hit_cls)).sum())
+        st["trunk_err"], st["ch_fixed"] = int(err.sum()), int(fixed.sum())
+        st["trunk_err_track"], st["ch_fixed_track"] = int((err & track).sum()), int((fixed & track).sum())
+        st["ch_broken"] = int((pop & (hit_pcls == hit_cls) & (chan_cls != hit_cls)).sum())
+        st["ch_pairs"], st["ch_pairs_same"] = pair_counts(hit_pid[pop], chan_cls[pop])
+        st["trunk_pairs_same"] = pair_counts(hit_pid[pop], hit_pcls[pop])[1]
     if hit_pcls is not None:
         diff = (pid >= 0) & (ccls != hit_cls[miss])
         same_pred = cand_pcls[picked] == hit_pcls[miss]
@@ -226,11 +255,14 @@ def cmd_run(a):
             emb = d["hit_x"][:, :readout[0].shape[1]]                # original h.x, not probe channels
             hp = sp.predicted_logits(emb, readout).argmax(dim=1).cpu().numpy()
             pc = {"hit_pcls": hp, "cand_pcls": hp[d["cp"].cpu().numpy()]}
+            if cfg.get("class_channels") in ("oracle",) + sp.LABEL_MODES:        # R9 construction counters
+                F = cfg["hit_dim"] - sp.CLASS_BUCKETS
+                pc["chan_cls"] = d["hit_x"][:, F:].argmax(dim=1).cpu().numpy()
         ev, st, labels = analyse_event(
             W.cpu().numpy(), d["nb"].cpu().numpy(), d["own"].cpu().numpy(), pop.cpu().numpy(),
             np.where(d["own"].any(dim=1).cpu().numpy(), d["correct"].cpu().numpy(), -1),
             d["seed_true"].cpu().numpy(), ysem[cand_hit].cpu().numpy(), ysem[fg_idx.cpu()].cpu().numpy(),
-            ari_fn, **pc)
+            ari_fn, hit_pid=yi[fg_idx.cpu()].cpu().numpy(), **pc)
         key = (int(d["batch"]), int(d["event"]))
         if not same_partition(labels["pick_only"].tolist(), ref_fg.cpu().tolist()):
             r1_fail.append(key)

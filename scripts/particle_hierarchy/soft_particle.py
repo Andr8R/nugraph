@@ -696,7 +696,13 @@ def to_store(d):
 
 CLASS_BUCKETS = 8                   # 7 semantic classes + "unlabelled" (y_sem < 0)
 CLASS_MODES = ("none", "zeros", "oracle", "pred",
-               "s_zeros", "s_oracle", "s_oracle_seed", "s_oracle_hit", "s_pred_hard")    # s_*: R8 split blocks
+               "s_zeros", "s_oracle", "s_oracle_seed", "s_oracle_hit", "s_pred_hard",    # s_*: R8 split blocks
+               "trueclass", "cons", "fix50", "fixtrack")                                 # R9 label arms
+LABEL_MODES = ("trueclass", "cons", "fix50", "fixtrack")
+READOUT_MODES = ("pred", "s_pred_hard") + LABEL_MODES
+ORACLE_MODES = ("oracle", "s_oracle", "s_oracle_seed", "s_oracle_hit") + LABEL_MODES     # truth-derived inputs
+TRACK_CLASSES = (0, 1, 2, 3)        # pion, muon, kaon, hadron
+FIX_SEED = 20260927
 SPLIT_MODES = {  # (hit block, candidate block): None = zeros, "true" = true one-hot, "hard" = argmax one-hot
     "s_zeros": (None, None), "s_oracle": ("true", "true"), "s_oracle_seed": (None, "true"),
     "s_oracle_hit": ("true", None), "s_pred_hard": ("hard", "hard")}
@@ -755,6 +761,9 @@ def class_channels(d, mode, readout=None):
         return torch.nn.functional.one_hot(ys, CLASS_BUCKETS).to(device=dev, dtype=d["hit_x"].dtype)
     if mode in SPLIT_MODES:
         return split_channels(d, mode, readout)
+    if mode in LABEL_MODES:
+        ys = label_classes(d, mode, readout)
+        return torch.nn.functional.one_hot(ys, CLASS_BUCKETS).to(device=dev, dtype=d["hit_x"].dtype)
     if mode == "pred":
         if readout is None:
             raise ValueError("class_channels('pred') needs the cache's semantic read-out")
@@ -762,6 +771,50 @@ def class_channels(d, mode, readout=None):
         pad = torch.zeros(n, CLASS_BUCKETS - p.size(1), device=dev, dtype=p.dtype)
         return torch.cat([p, pad], dim=1).to(d["hit_x"].dtype)
     raise ValueError(f"unknown class_channels mode {mode!r}")
+
+
+def label_classes(d, mode, readout=None):
+    """Stage 1a-R9 channel class per foreground hit (CPU long tensor; ORACLE UPPER BOUNDS, all use truth).
+
+    argmax = the trunk's own class (exact read-out of h.x). Hits with y_sem < 0 keep their argmax in every mode,
+    so the unlabelled bucket is never used.
+    trueclass  true class on labelled hits
+    cons       the argmax majority over the hit's TRUE particle (ties -> lowest class); no particle -> argmax
+    fix50      floor(n_err / 2) of the event's labelled wrong hits corrected, chosen by a local RNG seeded by
+               (FIX_SEED, batch, event) -- the global torch RNG is never touched
+    fixtrack   every labelled wrong hit of a track class (pion / muon / kaon / hadron) corrected
+    """
+    import numpy as np
+    import torch
+    if readout is None:
+        raise ValueError(f"class_channels({mode!r}) needs the cache's semantic read-out")
+    fgc = d["fg_idx"].cpu()
+    ys = d["y_sem"][fgc].long().numpy()
+    yi = d["y_i"][fgc].long().numpy()
+    am = predicted_logits(d["hit_x"], readout).argmax(dim=1).cpu().numpy()
+    out = am.copy()
+    err = (ys >= 0) & (am != ys)
+    if mode == "trueclass":
+        lab = ys >= 0
+        out[lab] = ys[lab]
+    elif mode == "cons":
+        part = yi >= 0
+        if part.any():
+            _, inv = np.unique(yi[part], return_inverse=True)
+            counts = np.zeros((inv.max() + 1, CLASS_BUCKETS), dtype=np.int64)
+            np.add.at(counts, (inv, am[part]), 1)
+            out[part] = counts.argmax(axis=1)[inv]
+    elif mode == "fix50":
+        idx = np.flatnonzero(err)
+        rng = np.random.default_rng([FIX_SEED, int(d["batch"]), int(d["event"])])
+        pick = rng.permutation(idx)[:idx.size // 2]
+        out[pick] = ys[pick]
+    elif mode == "fixtrack":
+        sel = err & np.isin(ys, TRACK_CLASSES)
+        out[sel] = ys[sel]
+    else:
+        raise ValueError(f"unknown label mode {mode!r}")
+    return torch.as_tensor(out, dtype=torch.long)
 
 
 def split_channels(d, mode, readout=None):
@@ -797,7 +850,7 @@ def split_channels(d, mode, readout=None):
 
 def iter_events(cache, lo, hi, mat, rule_fn, a, dev, need_hit_x=True, store=False):
     mode = getattr(a, "class_channels", "none")
-    readout = semantic_readout(cache) if mode in ("pred", "s_pred_hard") else None
+    readout = semantic_readout(cache) if mode in READOUT_MODES else None
     for ev in mb.iter_cache(cache, lo, hi):
         d = prepare(ev, mat, rule_fn, a.m, a.t_d, a.t_assign, dev, need_hit_x)
         if d is not None:
@@ -833,7 +886,7 @@ def cmd_train(a):
     import torch
     mat, dev = _setup(a)
     rule_fn = s0.make_rule(a.rule)
-    if a.class_channels in ("pred", "s_pred_hard") and a.dev_cache:
+    if a.class_channels in READOUT_MODES and a.dev_cache:
         if _manifest_sha(a.train_cache) is None or _manifest_sha(a.train_cache) != _manifest_sha(a.dev_cache):
             raise SystemExit("pred class channels need train and dev caches from the same checkpoint")
     torch.manual_seed(a.seed)
@@ -846,7 +899,7 @@ def cmd_train(a):
     if a.class_channels in SPLIT_MODES:
         model.split_k = CLASS_BUCKETS
     init_sha = state_sha256(model)
-    if "oracle" in a.class_channels:
+    if a.class_channels in ORACLE_MODES:
         print("  *** ORACLE UPPER BOUND: the head sees TRUE semantic classes; not a deployable model ***",
               flush=True)
     gb = sum(v.numel() * v.element_size() for d in train for v in d.values()
@@ -864,7 +917,7 @@ def cmd_train(a):
            "n_train_events": len(train), "target": a.target, "exist_target": a.exist_target,
            "merge_scope": a.merge_scope, "dist_only": a.dist_only, "decode": a.decode,
            "decode_kwargs": decode_kwargs(a), "selection": "dev-A ari_particle, decode above",
-           "class_channels": a.class_channels, "oracle_upper_bound": "oracle" in a.class_channels,
+           "class_channels": a.class_channels, "oracle_upper_bound": a.class_channels in ORACLE_MODES,
            "latent_checkpoint_sha256": _manifest_sha(a.train_cache),
            "init_sha256": init_sha, "perm_sha256": [],
            "split_channels": CLASS_BUCKETS if a.class_channels in SPLIT_MODES else 0}
