@@ -54,8 +54,24 @@ def pair_counts(part, lab):
     return int((pc * (pc - 1) // 2).sum()), int((kc * (kc - 1) // 2).sum())
 
 
+def pair_stats(part, lab):
+    """Over all pairs of the given hits: (pairs, same particle, same label, same particle and same label)."""
+    import numpy as np
+    n = part.size
+    if n < 2:
+        return 0, 0, 0, 0
+    c2 = lambda c: int((c * (c - 1) // 2).sum())
+    _, pc = np.unique(part, return_counts=True)
+    _, lc = np.unique(lab, return_counts=True)
+    _, bc = np.unique(np.stack([part, lab], axis=1), axis=0, return_counts=True)
+    return n * (n - 1) // 2, c2(pc), c2(lc), c2(bc)
+
+
+CO_STATS = ("pairs", "same_part", "same_lab", "same_both")
+
+
 def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, ks=KS,
-                  hit_pcls=None, cand_pcls=None, hit_pid=None, chan_cls=None):
+                  hit_pcls=None, cand_pcls=None, hit_pid=None, chan_cls=None, dec_labels=None):
     """One event's labels, ARIs and hit-level counts.
 
     W (n, m) membership probabilities over the hit's m candidates (columns in distance order);
@@ -68,6 +84,10 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
     hit_pid (optional, Stage 1a-R9): true particle id of each hit; adds same-particle co-assignment of the picked
     candidate among available and among unavailable population hits. chan_cls (optional, with hit_pcls): the
     class each hit's probe channels carry; adds the channel construction counters.
+    Stage 1a-R10 (with hit_pid): pair statistics `co_{pick,dec}_{pop,avail,unavail}_{pairs,same_part,same_lab,
+    same_both}` over population hits, all of them / reachable only / unreachable only, for the top-1 pick and, with
+    dec_labels (the deployed decode's labels over the same n hits), for the decoded clusters. Reachable-unreachable
+    pairs are pop minus the other two.
     """
     import numpy as np
     n, m = W.shape
@@ -114,6 +134,11 @@ def analyse_event(W, nb, own, pop, owner, cand_pid, cand_cls, hit_cls, ari_fn, k
     if hit_pid is not None:
         for tag, sel in (("avail", avail), ("unavail", pop & ~avail)):
             st[f"coassign_{tag}_pairs"], st[f"coassign_{tag}_same"] = pair_counts(hit_pid[sel], top1[sel])
+        levels = [("pick", top1)] + ([("dec", np.asarray(dec_labels))] if dec_labels is not None else [])
+        for lvl, lab in levels:
+            for tag, sel in (("pop", pop), ("avail", avail), ("unavail", pop & ~avail)):
+                for k, v in zip(CO_STATS, pair_stats(hit_pid[sel], lab[sel])):
+                    st[f"co_{lvl}_{tag}_{k}"] = v
     if hit_pcls is not None and chan_cls is not None:
         err = pop & (hit_pcls != hit_cls)
         track = np.isin(hit_cls, TRACK)
@@ -239,6 +264,8 @@ def cmd_run(a):
             lg, _, _, _ = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
             W = lg.softmax(dim=1)[:, :d["m"]]
             ref_fg, _ = sp.predict_labels(model, d, **sp._OFF)
+            dec_fg = (sp.predict_labels(model, d, **cfg["decode_kwargs"])[0]      # the deployed decode
+                      if "decode_kwargs" in cfg else None)
         fg_idx = d["fg_idx"]
         ysem, yi = d["y_sem"], d["y_i"]
         keep = d["fg"] & (ysem >= 0)
@@ -262,7 +289,7 @@ def cmd_run(a):
             W.cpu().numpy(), d["nb"].cpu().numpy(), d["own"].cpu().numpy(), pop.cpu().numpy(),
             np.where(d["own"].any(dim=1).cpu().numpy(), d["correct"].cpu().numpy(), -1),
             d["seed_true"].cpu().numpy(), ysem[cand_hit].cpu().numpy(), ysem[fg_idx.cpu()].cpu().numpy(),
-            ari_fn, hit_pid=yi[fg_idx.cpu()].cpu().numpy(), **pc)
+            ari_fn, hit_pid=yi[fg_idx.cpu()].cpu().numpy(), dec_labels=None if dec_fg is None else dec_fg.cpu().numpy(), **pc)
         key = (int(d["batch"]), int(d["event"]))
         if not same_partition(labels["pick_only"].tolist(), ref_fg.cpu().tolist()):
             r1_fail.append(key)

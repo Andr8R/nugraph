@@ -60,6 +60,8 @@ s0 = _load("stage0_seed_diag", HERE / "stage0_seed_diag.py")
 
 NAN = float("nan")
 IGNORE = -100
+COMEM_PAIRS = 2048                  # Stage 1a-R10: positive and negative pairs per event
+COMEM_SEED = 20260928               # private pair-sampling generator = COMEM_SEED + head seed
 DEFAULT_RULE = "quant:0.995:0.05:0.5"
 
 
@@ -341,15 +343,87 @@ def membership_loss(lg, d, target):
 
 
 def event_loss(model, d, w_exist=1.0, w_merge=1.0, target="primary", exist_target="primary",
-               merge_scope="all"):
-    loss_mem, loss_ex, loss_mg = event_loss_terms(model, d, target, exist_target, merge_scope)
+               merge_scope="all", comem=0.0, comem_gen=None, comem_pairs=COMEM_PAIRS):
+    """Stage-1a loss of one event. With `comem_gen` (Stage 1a-R10) the co-membership term is computed and logged;
+    it is added to the loss only when comem > 0, so a lambda = 0 control follows the identical path."""
+    loss_mem, loss_ex, loss_mg, lg = _event_loss_terms(model, d, target, exist_target, merge_scope)
     total = loss_mem + w_exist * loss_ex + w_merge * loss_mg
-    return total, {"mem": float(loss_mem.detach()), "exist": float(loss_ex.detach()),
-                   "merge": float(loss_mg.detach())}
+    parts = {"mem": float(loss_mem.detach()), "exist": float(loss_ex.detach()), "merge": float(loss_mg.detach())}
+    if comem_gen is not None:
+        i, j, same = comem_sample(d, comem_pairs, comem_gen)
+        lc = comem_loss(lg, d, i, j, same)
+        parts["comem"] = float(lc.detach())
+        if comem:
+            total = total + comem * lc
+    return total, parts
+
+
+COMEM_EPS = 1e-6
+
+
+def comem_sample(d, n_pairs, gen):
+    """Stage 1a-R10: same-particle and different-particle pairs of POPULATION hits (reachable or not).
+
+    Positives: anchor uniform among population hits whose particle has >= 2 of them, partner uniform among the rest
+    of its particle. Negatives: both uniform among population hits, kept if their particles differ. All draws use the
+    private CPU generator `gen`, never the global torch RNG. Returns fg-row indices (i, j) and a bool `same`.
+    """
+    import torch
+    pop = d["pop_fg"].cpu()
+    idx = pop.nonzero(as_tuple=False).squeeze(1)
+    empty = torch.zeros(0, dtype=torch.long)
+    if idx.numel() < 2:
+        return empty, empty, torch.zeros(0, dtype=torch.bool)
+    pid = d["y_i"].cpu()[d["fg_idx"].cpu()][idx].long()
+    pid, order = torch.sort(pid, stable=True)
+    idx = idx[order]
+    uniq, counts = torch.unique_consecutive(pid, return_counts=True)
+    start = counts.cumsum(0) - counts
+    part = torch.repeat_interleave(torch.arange(uniq.numel()), counts)       # particle slot of each sorted hit
+    elig = (counts[part] >= 2).nonzero(as_tuple=False).squeeze(1)
+    pi = pj = empty
+    if elig.numel():
+        a = elig[torch.randint(elig.numel(), (n_pairs,), generator=gen)]
+        c = counts[part[a]]
+        off = (torch.rand(n_pairs, generator=gen) * (c - 1)).long().clamp(max=c - 2)
+        b = start[part[a]] + off
+        b = b + (b >= a).long()                                               # skip the anchor itself
+        pi, pj = idx[a], idx[b]
+    na, nb_ = (torch.randint(idx.numel(), (2, 2 * n_pairs), generator=gen))
+    keep = (pid[na] != pid[nb_]).nonzero(as_tuple=False).squeeze(1)[:n_pairs]
+    ni, nj = idx[na[keep]], idx[nb_[keep]]
+    same = torch.cat([torch.ones(pi.numel(), dtype=torch.bool), torch.zeros(ni.numel(), dtype=torch.bool)])
+    return torch.cat([pi, ni]), torch.cat([pj, nj]), same
+
+
+def comem_overlap(lg, nb, i, j):
+    """s_ij = sum_k w_i(k) w_j(k) over candidates in both hits' neighbour lists (null mass excluded)."""
+    w = lg.softmax(dim=1)[:, :nb.size(1)]
+    eq = (nb[i][:, :, None] == nb[j][:, None, :]).to(w.dtype)
+    return (w[i][:, :, None] * w[j][:, None, :] * eq).sum(dim=(1, 2))
+
+
+def comem_loss(lg, d, i, j, same):
+    """-log s on same-particle pairs + -log(1 - s) on different-particle pairs (each a mean; 0 if none)."""
+    if i.numel() == 0:
+        return lg.sum() * 0.0
+    dev = lg.device
+    i, j, same = i.to(dev), j.to(dev), same.to(dev)
+    s = comem_overlap(lg, d["nb"], i, j)
+    out = lg.sum() * 0.0
+    if bool(same.any()):
+        out = out - (s[same] + COMEM_EPS).log().mean()
+    if bool((~same).any()):
+        out = out - (1 - s[~same] + COMEM_EPS).log().mean()
+    return out
 
 
 def event_loss_terms(model, d, target="primary", exist_target="primary", merge_scope="all"):
     """(membership, existence, merge) losses of one event as tensors."""
+    return _event_loss_terms(model, d, target, exist_target, merge_scope)[:3]
+
+
+def _event_loss_terms(model, d, target, exist_target, merge_scope):
     import torch.nn.functional as F
     lg, c, cen, e = model(d["hit_x"], d["ox"], d["beta"], d["cp"], d["nb"])
     loss_mem = membership_loss(lg, d, target)
@@ -362,7 +436,7 @@ def event_loss_terms(model, d, target="primary", exist_target="primary", merge_s
         w = lg.softmax(dim=1)[:, :-1]
         loss_mg = F.binary_cross_entropy_with_logits(
             model.merge_logits(c, cen, pairs, w, d["nb"]), tgt)
-    return loss_mem, loss_ex, loss_mg
+    return loss_mem, loss_ex, loss_mg, lg
 
 
 # --------------------------------------------------------------------------- #
@@ -920,17 +994,21 @@ def cmd_train(a):
            "class_channels": a.class_channels, "oracle_upper_bound": a.class_channels in ORACLE_MODES,
            "latent_checkpoint_sha256": _manifest_sha(a.train_cache),
            "init_sha256": init_sha, "perm_sha256": [],
-           "split_channels": CLASS_BUCKETS if a.class_channels in SPLIT_MODES else 0}
+           "split_channels": CLASS_BUCKETS if a.class_channels in SPLIT_MODES else 0,
+           "comem": a.comem, "comem_pairs": a.comem_pairs}
+    # R10: pairs come from a private generator, so the global RNG (init, permutations) is untouched in every arm
+    comem_gen = torch.Generator().manual_seed(COMEM_SEED + a.seed)
     hist, best, best_epoch = [], -math.inf, None
     for epoch in range(a.epochs):
         model.train()
         perm = torch.randperm(len(train))
         cfg["perm_sha256"].append(hashlib.sha256(perm.numpy().tobytes()).hexdigest())
-        tot, parts, n = 0.0, {"mem": 0.0, "exist": 0.0, "merge": 0.0}, 0
+        tot, parts, n = 0.0, {"mem": 0.0, "exist": 0.0, "merge": 0.0, "comem": 0.0}, 0
         opt.zero_grad()
         for j, i in enumerate(perm.tolist()):
             loss, p = event_loss(model, to_device(train[i], dev), a.w_exist, a.w_merge,
-                                 a.target, a.exist_target, a.merge_scope)
+                                 a.target, a.exist_target, a.merge_scope, comem=a.comem,
+                                 comem_gen=comem_gen, comem_pairs=a.comem_pairs)
             (loss / a.accum).backward()
             tot += float(loss.detach()); n += 1
             for k in p: parts[k] += p[k]
@@ -1384,6 +1462,10 @@ def main():
                         "R5), 'pred' = the trunk's own semantic probabilities recomputed from hit_x (R6)")
     s.add_argument("--dist-only", action="store_true",
                    help="ablation: membership from latent distance + existence only (no pair_net)")
+    s.add_argument("--comem", type=float, default=0.0,
+                   help="R10: weight of the co-membership term over same / different-particle population hit "
+                        "pairs (always computed and logged; added to the loss only when > 0)")
+    s.add_argument("--comem-pairs", type=int, default=COMEM_PAIRS, help="R10: positive and negative pairs per event")
     s.set_defaults(fn=cmd_train)
 
     s = sub.add_parser("readout-check")
