@@ -113,31 +113,71 @@ def read_split(root, split):
     return fails, data
 
 
-def f5_fails(data, r10_root):
-    fails = []
+def exact(x, y):
+    return (math.isnan(x) and math.isnan(y)) or x == y
+
+
+def f5_fails(data, r10_root, cpu_root=None, cpu_heads=()):
+    """F5. Heads in `cpu_heads` (Amendment 1) are decided by the CPU pair under cpu_root instead: R10's diagnose
+    re-run on CPU vs R11's eval on CPU, EXACT per-event equality for both decodes, no near-tie allowance."""
+    fails, info = [], {"cpu": {}}
     for dec in DECODES:
         for arm in ARMS:
             for t in SEEDS:
+                n = name(arm, t)
+                if n in cpu_heads:
+                    d = Path(cpu_root)
+                    summ = json.loads((d / "diag_last" / n / "diagnose_summary.json").read_text())
+                    if not str(summ.get("head", "")).endswith(f"heads/{n}/head.pt"):
+                        fails.append(f"F5-CPU {n}: CPU diagnose read {summ.get('head')}, not the frozen head")
+                    old = r10(d, arm, t, R10_VARIANT[dec])
+                    rows, meta = load(d, "devA", dec, arm, t)
+                    fails += [x.replace("F", "F5-CPU/F", 1) for x in meta_fails(meta, "devA-cpu", dec, arm, t)]
+                    if set(old) != set(rows):
+                        fails.append(f"F5-CPU {dec} {n}: CPU event sets differ")
+                        continue
+                    flips = [k for k in old if not exact(old[k], fnum(rows[k]["ari_particle"]))]
+                    info["cpu"][f"{dec} {n}"] = len(flips)
+                    if flips:
+                        fails.append(f"F5-CPU {dec} {n}: {len(flips)} dev-A events differ between CPU diagnose "
+                                     "and CPU eval (exact equality required)")
+                    continue
                 old = r10(r10_root, arm, t, R10_VARIANT[dec])
                 new = data[("devA", dec, arm, t)]
                 if set(old) != set(new):
-                    fails.append(f"F5 {dec} {name(arm, t)}: dev-A event set differs from R10")
+                    fails.append(f"F5 {dec} {n}: dev-A event set differs from R10")
                     continue
                 flips = [k for k in old if not same(old[k], fnum(new[k]["ari_particle"]))]
                 if len(flips) > MAX_FLIPS:
-                    fails.append(f"F5 {dec} {name(arm, t)}: {len(flips)} dev-A events differ from R10 "
-                                 f"(limit {MAX_FLIPS})")
-    return fails
+                    fails.append(f"F5 {dec} {n}: {len(flips)} dev-A events differ from R10 (limit {MAX_FLIPS})")
+    return fails, info
 
 
-def devA_gates(root, r10_root):
+def gpu_repeat(root, repeat_root):
+    """Descriptive (Amendment 1): events differing between two GPU evals of the same head and decode."""
+    out = {}
+    if not repeat_root or not Path(repeat_root).exists():
+        return out
+    for d in sorted(Path(repeat_root).glob("*/*")):
+        dec, n = d.parent.name, d.name
+        a = {k: fnum(r["ari_particle"]) for k, r in load(root, "devA", dec, *n.rsplit("_s", 1)[:1],
+                                                          int(n.rsplit("_s", 1)[1]))[0].items()}
+        b = {(int(r["batch"]), int(r["event"])): fnum(r["ari_particle"])
+             for r in csv.DictReader(open(d / "eval_events.csv"))}
+        out[f"{dec} {n}"] = sum(1 for k in a if k in b and not exact(a[k], b[k]))
+    return out
+
+
+def devA_gates(root, r10_root, cpu_root=None, cpu_heads=(), repeat_root=None):
     """F1 / F4 on the dev-A evaluations and F5; checked BEFORE dev-B is read."""
     fails, data = read_split(root, "devA")
-    return fails + f5_fails(data, r10_root), data
+    f5, info = f5_fails(data, r10_root, cpu_root, cpu_heads)
+    info["gpu_repeat"] = gpu_repeat(root, repeat_root)
+    return fails + f5, data, info
 
 
-def gates(root, r10_root):
-    fails, data = devA_gates(root, r10_root)
+def gates(root, r10_root, cpu_root=None, cpu_heads=(), repeat_root=None):
+    fails, data, info = devA_gates(root, r10_root, cpu_root, cpu_heads, repeat_root)
     fb, db = read_split(root, "devB")
     fails += fb
     data.update(db)
@@ -154,12 +194,13 @@ def gates(root, r10_root):
                                                       fnum(x[k]["ari_particle_hardseed"]))]
                     if bad:
                         fails.append(f"F3 {split}/{dec} seed {t}: {arm} hard-seed ARI differs on {len(bad)} events")
-    return fails, data
+    return fails, data, info
 
 
-def evaluate(root, r10_root):
-    fails, data = gates(root, r10_root)
-    res = {"gates": {"pass": not fails, "failures": fails}, "devB": {}, "devA": {}}
+def evaluate(root, r10_root, cpu_root=None, cpu_heads=(), repeat_root=None):
+    fails, data, info = gates(root, r10_root, cpu_root, cpu_heads, repeat_root)
+    res = {"gates": {"pass": not fails, "failures": fails, "f5_cpu_heads": list(cpu_heads), **info},
+           "devB": {}, "devA": {}}
     for split in ("devB", "devA"):
         for dec in DECODES:
             for t in SEEDS:
@@ -207,6 +248,10 @@ def render(res):
          "(a REUSED split, 4th read; frozen R10 heads)", "",
          f"**Gates:** {'PASS' if res['gates']['pass'] else 'FAIL'}"]
     L += [f"- {x}" for x in res["gates"]["failures"]]
+    if res["gates"].get("f5_cpu_heads"):
+        L.append(f"- Amendment 1: F5 for {', '.join(res['gates']['f5_cpu_heads'])} decided by CPU re-execution "
+                 f"(exact): differing events {res['gates'].get('cpu')}; GPU repeat (descriptive): "
+                 f"{res['gates'].get('gpu_repeat')}")
     L += ["", f"**Reading:** {V['reading']} — {V['next']}", "",
           "## Primary: dev-B, decode NM (no merge), paired Δ ARI vs CTRL ± event SE", "",
           "| arm | " + " | ".join(f"seed {t}" for t in SEEDS) + " | mean |", "|---" * (len(SEEDS) + 2) + "|"]
@@ -245,16 +290,17 @@ def render(res):
 
 
 def cmd_f5(a):
-    fails, _ = devA_gates(a.root, a.r10_root)
+    fails, _, info = devA_gates(a.root, a.r10_root, a.f5_cpu_root, tuple(a.f5_cpu_heads), a.gpu_repeat_root)
     for f in fails:
         print(f)
+    print(json.dumps(info))
     if fails:
         raise SystemExit(1)
     print("F1 / F4 / F5 on dev-A: PASS")
 
 
 def cmd_report(a):
-    res = evaluate(a.root, a.r10_root)
+    res = evaluate(a.root, a.r10_root, a.f5_cpu_root, tuple(a.f5_cpu_heads), a.gpu_repeat_root)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(json.dumps(res, indent=2, default=str))
@@ -264,6 +310,12 @@ def cmd_report(a):
         raise SystemExit(1)
 
 
+def amend(s):
+    s.add_argument("--f5-cpu-root", default=None, help="Amendment 1: root of the CPU diagnose / eval pair")
+    s.add_argument("--f5-cpu-heads", nargs="*", default=[], help="Amendment 1: heads whose F5 is decided on CPU")
+    s.add_argument("--gpu-repeat-root", default=None, help="Amendment 1: descriptive GPU repeat evals")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -271,10 +323,12 @@ def main():
     s.add_argument("--root", required=True)
     s.add_argument("--r10-root", required=True, help="the R10 comem root (gate F5)")
     s.add_argument("--out", required=True)
+    amend(s)
     s.set_defaults(fn=cmd_report)
     s = sub.add_parser("f5", help="gates F1 / F4 / F5 on the dev-A evaluations only (run before dev-B is read)")
     s.add_argument("--root", required=True)
     s.add_argument("--r10-root", required=True)
+    amend(s)
     s.set_defaults(fn=cmd_f5)
     a = p.parse_args()
     a.fn(a)

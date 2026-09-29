@@ -184,3 +184,74 @@ def test_eval_no_merge_reproduces_diagnose_and_records_provenance(tmp_path, monk
     assert meta["head_sha256"] == sp.mb.sha256(head) and meta["cache_checkpoint_sha256"] == "ck"
     assert meta["head_latent_checkpoint_sha256"] == "ck"
     assert torch.load(head, weights_only=False)["cfg"]["comem"] == 0.0
+
+
+# ---- Amendment 1: CPU-exact F5 for CM1_s2 (pure python) ------------------------------------------- #
+def cpu_pair(root, cpu, flips=0, head_path=None, repeat_flips=None):
+    """Write a CPU diagnose / eval pair for CM1_s2 from the dev-A GPU evals (identical unless `flips`)."""
+    import shutil
+    n = "CM1_s2"
+    rows = []
+    for dec in cc.DECODES:
+        src = root / "devA" / dec / n
+        dst = cpu / "devA" / dec / n
+        dst.mkdir(parents=True)
+        shutil.copy(src / "eval_eval_meta.json", dst)
+        ev = list(csv.DictReader(open(src / "eval_events.csv")))
+        write_csv(dst / "eval_events.csv", EVAL_F, ev)
+        for i, r in enumerate(ev):
+            ari = float(r["ari_particle"]) + (1e-12 if dec == "NM" and i < flips else 0.0)
+            rows.append({"batch": r["batch"], "event": r["event"], "variant": cc.R10_VARIANT[dec], "ari_particle": ari})
+        if repeat_flips is not None and dec == "NM":
+            rep = root.parent / "repeat" / dec / n
+            rr = [dict(r, ari_particle=float(r["ari_particle"]) + (1e-5 if i < repeat_flips else 0.0))
+                  for i, r in enumerate(ev)]
+            write_csv(rep / "eval_events.csv", EVAL_F, rr)
+    d = cpu / "diag_last" / n
+    write_csv(d / "diagnose_events.csv", ["batch", "event", "variant", "ari_particle"], rows)
+    (d / "diagnose_summary.json").write_text(json.dumps({"head": head_path or f"/x/comem/heads/{n}/head.pt"}))
+
+
+def test_amendment_cpu_exact_replaces_the_failing_gpu_check(tmp_path):
+    root, r10 = build(tmp_path, r10_shift=4)                      # the observed failure: 4 GPU flips
+    assert any(f.startswith("F5 NM CM1_s2: 4") for f in cc.evaluate(root, r10)["gates"]["failures"])
+    cpu_pair(root, tmp_path / "cpu", repeat_flips=3)
+    res = cc.evaluate(root, r10, tmp_path / "cpu", ("CM1_s2",), tmp_path / "repeat")
+    assert res["gates"]["pass"], res["gates"]["failures"]
+    assert res["gates"]["cpu"] == {"NM CM1_s2": 0, "DEP CM1_s2": 0}
+    assert res["gates"]["gpu_repeat"] == {"NM CM1_s2": 3}           # descriptive only
+    assert res["verdict"]["reading"] == "CONFIRMED"
+    assert "Amendment 1" in cc.render(res)
+
+
+def test_amendment_requires_exact_equality(tmp_path):
+    root, r10 = build(tmp_path, r10_shift=4)
+    cpu_pair(root, tmp_path / "cpu", flips=1)                       # a single 1e-12 difference fails
+    res = cc.evaluate(root, r10, tmp_path / "cpu", ("CM1_s2",))
+    assert any(f.startswith("F5-CPU NM CM1_s2: 1 dev-A events differ") for f in res["gates"]["failures"])
+    assert res["verdict"]["reading"] == "INVALID"
+
+
+def test_amendment_checks_the_cpu_provenance(tmp_path):
+    root, r10 = build(tmp_path, r10_shift=4)
+    cpu_pair(root, tmp_path / "cpu", head_path="/x/comem/heads/CM1_s1/head.pt")
+    res = cc.evaluate(root, r10, tmp_path / "cpu", ("CM1_s2",))
+    assert any(f.startswith("F5-CPU CM1_s2: CPU diagnose read") for f in res["gates"]["failures"])
+    meta = tmp_path / "cpu" / "devA" / "DEP" / "CM1_s2" / "eval_eval_meta.json"
+    m = json.loads(meta.read_text())
+    m["decode_kwargs"] = cc.DECODE_KW["NM"]
+    meta.write_text(json.dumps(m))
+    res = cc.evaluate(root, r10, tmp_path / "cpu", ("CM1_s2",))
+    assert any(f.startswith("F5-CPU/F4 devA-cpu/DEP/CM1_s2") for f in res["gates"]["failures"])
+
+
+def test_other_heads_keep_the_gpu_limit_under_the_amendment(tmp_path):
+    root, r10 = build(tmp_path, r10_shift=4)
+    cpu_pair(root, tmp_path / "cpu")
+    p = r10 / "diag_last" / "CTRL_s1" / "diagnose_events.csv"
+    rows = list(csv.DictReader(open(p)))
+    for r in rows[:3]:
+        r["ari_particle"] = float(r["ari_particle"]) + 0.01
+    write_csv(p, ["batch", "event", "variant", "ari_particle"], rows)
+    res = cc.evaluate(root, r10, tmp_path / "cpu", ("CM1_s2",))
+    assert any(f.startswith("F5 NM CTRL_s1: 3") for f in res["gates"]["failures"])
