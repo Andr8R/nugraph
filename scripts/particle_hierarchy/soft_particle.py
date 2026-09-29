@@ -573,6 +573,8 @@ def decode_kwargs(a):
         kw["exist_thr"] = a.exist_thr
     if getattr(a, "no_null", False):
         kw["allow_null"] = False
+    if getattr(a, "no_merge", False):          # Stage 1a-R11: the decode without the learned merge step
+        kw["merge_thr"] = None
     return kw
 
 
@@ -1101,6 +1103,12 @@ def cmd_eval(a):
                          "split or pass --allow-heldout")
     model = load_head(ck, dev)
     evaluate(model, a, mat, s0.make_rule(cfg["rule"]), dev, a.cache, a.batches, a.out, a.tag)
+    # provenance for confirmation reports (R11): which head, which cache, which decode
+    meta = {"head": str(a.head), "head_sha256": mb.sha256(a.head), "cache": str(a.cache), "batches": a.batches,
+            "cache_checkpoint_sha256": _manifest_sha(a.cache),
+            "head_latent_checkpoint_sha256": cfg.get("latent_checkpoint_sha256"),
+            "decode_kwargs": decode_kwargs(a), "head_cfg_comem": cfg.get("comem"), **_prov(mat)}
+    (Path(a.out) / f"{a.tag}_eval_meta.json").write_text(json.dumps(meta, indent=2))
 
 
 def load_head(ck, dev):
@@ -1439,6 +1447,8 @@ def main():
         s.add_argument("--exist-thr", type=float, default=None)
         s.add_argument("--no-null", action="store_true",
                        help="never predict the null option at inference")
+        s.add_argument("--no-merge", action="store_true",
+                       help="skip the learned merge step at inference (merge_thr None; R11)")
 
     s = sub.add_parser("train"); common(s)
     s.add_argument("--train-cache", required=True)
