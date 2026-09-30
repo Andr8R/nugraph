@@ -9,6 +9,11 @@ data order and the same optimiser. The only difference:
   --arm T   the soft loss's gradient flows into the trunk (h.x, ox, beta not detached)
   --arm C   the soft layer sees detached trunk outputs (trunk trained by NuGraph's losses only)
 
+Stage 1c adds `--comem L` (with `--comem-log`): the Stage-1a-R10 co-membership term over same / different-particle
+population hit pairs is computed on the soft layer's memberships and added to the soft loss with weight L. With
+`--comem-log` alone (L = 0) it is computed and logged but not trained, so a matched control follows the same code
+path. Pairs come from a private CPU generator whose state is part of resume.pt.
+
 Soft-loss inputs are built per event by soft_particle.prepare() on detached copies, i.e. the
 exact Stage-1a candidate and truth path; for arm T the foreground hits' h.x / ox / beta are then
 swapped for the gradient-carrying tensors. Candidate selection is never differentiated.
@@ -148,6 +153,7 @@ class ResumableLoop:
         self.resume_every, self.limit = resume_every, limit_batches
         self.st = {"epoch": 0, "batches_done": 0, "global_step": 0}
         self.tr, self.hist, self.extra = {}, [], {}
+        self.gens = {}                   # private torch.Generators (e.g. Stage 1c pair sampling), resumed exactly
 
     # ---- to implement ----
     def modules(self):
@@ -169,6 +175,7 @@ class ResumableLoop:
                 "modules": {k: {n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
                             for k, m in self.modules().items()},
                 "optimizer": self.optimizer.state_dict(), "rng": rng_state(),
+                "gens": {k: g.get_state() for k, g in self.gens.items()},
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
     @property
@@ -194,6 +201,11 @@ class ResumableLoop:
         self.optimizer.load_state_dict(s["optimizer"])
         self.st, self.tr, self.hist, self.extra = s["st"], s["tr"], s["hist"], s["extra"]
         set_rng_state(s["rng"])
+        saved = s.get("gens", {})
+        if set(saved) != set(self.gens):
+            raise SystemExit(f"refusing to resume: private generators {sorted(saved)} != {sorted(self.gens)}")
+        for k, g in self.gens.items():
+            g.set_state(saved[k])
         self._truncate_steps(self.st["global_step"])
         return s
 
@@ -317,12 +329,15 @@ def event_inputs(ox, beta, hx, fg, y_i, y_sem, s, g):
 
 
 def soft_loss_from_hits(soft, ox, beta, hx, fg, y_i, y_sem, ptr, grad_to_trunk, rule_fn, mat,
-                        M, t_d, t_assign, dev, checkpoint=True, timers=None, sync=None):
+                        M, t_d, t_assign, dev, checkpoint=True, timers=None, sync=None,
+                        comem_gen=None, comem_pairs=None):
     """Mean over the batch's usable events of the Stage-1a (membership, existence, merge) losses.
 
     grad_to_trunk=False (arm C): the soft layer only sees detached copies, so the loss gives the
     trunk no gradient. True (arm T): foreground h.x / ox / beta are the trunk's own tensors.
-    Returns (terms (3,), number of usable events).
+    With comem_gen (Stage 1c) a 4th term, the Stage-1a-R10 co-membership loss, is appended; its pairs
+    are drawn per event from comem_gen (never the global RNG). The first three terms are unchanged.
+    Returns (terms (3,) or (4,), number of usable events).
     """
     import torch
     from torch.utils.checkpoint import checkpoint as ckpt
@@ -342,16 +357,23 @@ def soft_loss_from_hits(soft, ox, beta, hx, fg, y_i, y_sem, ptr, grad_to_trunk, 
             d["hit_x"], d["ox"], d["beta"] = hx[s][fgi], ox[s][fgi], beta[s][fgi]
         t0 = tick(timers, sync, "swap_grad_tensors", t0)
 
-        def fn(hit_x, oxx, bb, d=d):
+        pairs = (sp.comem_sample(d, comem_pairs or sp.COMEM_PAIRS, comem_gen)
+                 if comem_gen is not None else None)
+
+        def fn(hit_x, oxx, bb, d=d, pairs=pairs):
             dd = dict(d)
             dd["hit_x"], dd["ox"], dd["beta"] = hit_x, oxx, bb
-            return torch.stack(sp.event_loss_terms(soft, dd, **SOFT_TARGETS))
+            if pairs is None:
+                return torch.stack(sp.event_loss_terms(soft, dd, **SOFT_TARGETS))
+            mem, ex, mg, lg = sp._event_loss_terms(soft, dd, SOFT_TARGETS["target"],
+                                                   SOFT_TARGETS["exist_target"], SOFT_TARGETS["merge_scope"])
+            return torch.stack([mem, ex, mg, sp.comem_loss(lg, dd, *pairs)])
 
         args = (d["hit_x"], d["ox"], d["beta"])
         terms.append(ckpt(fn, *args, use_reentrant=False) if checkpoint else fn(*args))
         t0 = tick(timers, sync, "soft_fwd", t0)
     if not terms:
-        return torch.zeros(3, device=dev), 0
+        return torch.zeros(3 if comem_gen is None else 4, device=dev), 0
     out = torch.stack(terms).mean(0), len(terms)
     tick(timers, sync, "soft_other", t0)
     return out
@@ -391,6 +413,10 @@ class Stage1bLoop(ResumableLoop):
         self.prof_rows = []
         self.optimizer = torch.optim.AdamW([{"params": net.parameters(), "lr": a.lr},
                                             {"params": soft.parameters(), "lr": a.head_lr}])
+        self.comem_gen = None
+        if comem_active(a):              # Stage 1c: computed in both arms, trained only when a.comem > 0
+            self.comem_gen = torch.Generator().manual_seed(sp.COMEM_SEED + a.seed)
+            self.gens["comem"] = self.comem_gen
 
     def modules(self):
         return {"net": self.net, "soft": self.soft}
@@ -414,7 +440,8 @@ class Stage1bLoop(ResumableLoop):
                                    h.y_semantic, h.ptr, grad_to_trunk, self.rule_fn, self.mat,
                                    self.M, self.t_d, self.t_assign, self.dev,
                                    checkpoint=not self.a.no_soft_checkpoint,
-                                   timers=timers, sync=sync)
+                                   timers=timers, sync=sync, comem_gen=self.comem_gen,
+                                   comem_pairs=getattr(self.a, "comem_pairs", None))
 
     def step(self, batch):
         import torch
@@ -433,7 +460,11 @@ class Stage1bLoop(ResumableLoop):
         t0 = tick(timers, sync, "nugraph_fwd", t0)
         terms, n_soft = self._soft(batch, self.a.arm == "T", timers=timers, sync=sync)
         t0 = time.perf_counter() if prof else t0          # soft stages timed inside
-        soft_loss = terms.sum()
+        comem = getattr(self.a, "comem", 0.0)
+        if self.comem_gen is None:
+            soft_loss = terms.sum()
+        else:                                    # the first three terms exactly as without co-membership
+            soft_loss = terms[:3].sum() + (comem * terms[3] if comem else 0.0)
         loss = loss_ng + self.a.lam * soft_loss
         cons = None
         if self.a.sem_cons:                      # Stage 1a-R7: within-particle semantic consistency
@@ -468,7 +499,8 @@ class Stage1bLoop(ResumableLoop):
                 "soft": float(soft_loss.detach()), "mem": float(terms[0].detach()),
                 "exist": float(terms[1].detach()), "merge": float(terms[2].detach()),
                 "events": float(batch.num_graphs), "soft_events": float(n_soft),
-                **({"cons": float(cons.detach())} if cons is not None else {})}
+                **({"cons": float(cons.detach())} if cons is not None else {}),
+                **({"comem": float(terms[3].detach())} if self.comem_gen is not None else {})}
 
     def print_profile(self):
         """Mean seconds per stage over the profiled steps (diagnostic; syncs included)."""
@@ -576,12 +608,14 @@ class Stage1bLoop(ResumableLoop):
         row, rows = self.validate(epoch)
         n = max(self.tr.get("n", 0), 1)
         row.update({f"train/{k}": self.tr.get(k, 0.0) / n
-                    for k in ("loss", "loss_ng", "soft", "mem", "exist", "merge", "cons") if k in self.tr})
+                    for k in ("loss", "loss_ng", "soft", "mem", "exist", "merge", "cons", "comem")
+                    if k in self.tr})
         row.update({"train/steps": self.tr.get("n", 0), "train/events": self.tr.get("events", 0),
                     "train/soft_events": self.tr.get("soft_events", 0),
                     "global_step": self.st["global_step"]})
         self.record(epoch, row, rows)
-        meta = {"stage": "1b", "arm": self.a.arm, "seed": self.a.seed, "lam": self.a.lam,
+        meta = {"stage": "1c" if self.comem_gen is not None else "1b", "arm": self.a.arm,
+                "seed": self.a.seed, "lam": self.a.lam, "comem": getattr(self.a, "comem", 0.0),
                 "epoch": epoch, "global_step": self.st["global_step"]}
         save_trunk(self.net, self.base, self.out / f"trunk_ep{epoch}.ckpt", meta)
         save_soft(self.soft, self.head_cfg, self.out / f"soft_ep{epoch}.pt", meta)
@@ -617,6 +651,11 @@ def git_state(path):
     return {"git_commit": run("rev-parse", "HEAD"), "git_dirty": bool(run("status", "--short"))}
 
 
+def comem_active(a):
+    """Stage 1c: the co-membership term is computed when it is trained (--comem > 0) or logged (--comem-log)."""
+    return bool(getattr(a, "comem", 0.0) or getattr(a, "comem_log", False))
+
+
 def run_config(a, ckpt_sha, head_sha, git):
     """Everything that must be identical for a run to be resumed."""
     return {"arm": a.arm, "seed": a.seed, "lam": a.lam, "lr": a.lr, "head_lr": a.head_lr,
@@ -624,6 +663,9 @@ def run_config(a, ckpt_sha, head_sha, git):
             "limit_train_batches": a.limit_train_batches, "dev_batches": a.dev_batches,
             "no_soft_checkpoint": a.no_soft_checkpoint, "resume_every": a.resume_every,
             "sem_cons": a.sem_cons,
+            # Stage 1c: the co-membership weight, whether the term is computed, and its pair count
+            "comem": getattr(a, "comem", 0.0), "comem_log": comem_active(a),
+            "comem_pairs": getattr(a, "comem_pairs", None) if comem_active(a) else None,
             # profile_steps is likewise absent: it only adds timers and device syncs.
             # num_workers / prefetch_factor are deliberately absent: they change who reads the
             # batches, not which batches, so a run may be resumed with a different loader setting.
@@ -651,6 +693,11 @@ def main():
     p.add_argument("--sem-cons", type=float, default=0.0,
                    help="Stage 1a-R7: weight of the within-particle semantic-consistency loss "
                         "KL(sg(particle-mean p) || p_hit) on the trunk's semantic predictions (0 = off)")
+    p.add_argument("--comem", type=float, default=0.0,
+                   help="Stage 1c: weight of the co-membership term in the soft loss (0 = not trained)")
+    p.add_argument("--comem-log", action="store_true",
+                   help="Stage 1c: compute and log the co-membership term even when --comem is 0 (matched control)")
+    p.add_argument("--comem-pairs", type=int, default=2048, help="Stage 1c: pairs of each kind per event")
     p.add_argument("--lr", type=float, default=1e-4, help="trunk (as the ep29 run)")
     p.add_argument("--head-lr", type=float, default=1e-3, help="soft layer (as Stage 1a)")
     p.add_argument("--batch-size", type=int, default=32)

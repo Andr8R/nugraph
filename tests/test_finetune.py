@@ -468,3 +468,100 @@ def test_dev_identity_accepts_matching_and_refuses_other_events(tmp_path):
     wrong[9] = 99
     with pytest.raises(SystemExit):
         ft.dev_identity(_HeteroDataset(wrong), 0, 2, cache)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 1c: the co-membership term in the soft loss, private generator, exact resume
+# --------------------------------------------------------------------------- #
+def comem_loss(soft, tensors, grad_to_trunk, gen):
+    ox, beta, hx, fg, y, ysem, ptr = tensors
+    return ft.soft_loss_from_hits(soft, ox, beta, hx, fg, y, ysem, ptr, grad_to_trunk,
+                                  sp.s0.make_rule("fixed1:0.5"), mat, 3, 0.3, float("inf"), DEV,
+                                  checkpoint=False, comem_gen=gen, comem_pairs=256)
+
+
+def test_comem_appends_a_fourth_term_and_leaves_the_first_three_bitwise_unchanged():
+    soft = new_soft()
+    base, n0 = soft_loss(soft, batch_tensors(), True, checkpoint=False)
+    state = torch.get_rng_state()
+    t4, n4 = comem_loss(soft, batch_tensors(), True, torch.Generator().manual_seed(5))
+    assert torch.equal(state, torch.get_rng_state())                  # the global RNG is never used
+    assert n0 == n4 == 2 and t4.shape == (4,) and base.shape == (3,)
+    assert torch.equal(t4[:3].detach(), base.detach())
+    assert float(t4[3]) > 0
+    again, _ = comem_loss(soft, batch_tensors(), True, torch.Generator().manual_seed(5))
+    assert torch.equal(again.detach(), t4.detach())                   # a function of the generator state
+
+
+def test_the_logged_control_gives_exactly_the_stage1b_gradients_and_the_treatment_does_not():
+    soft = new_soft()
+
+    def grads(kind):
+        soft.zero_grad()
+        tt = batch_tensors()
+        if kind == "plain":
+            terms, _ = soft_loss(soft, tt, True, checkpoint=False)
+            loss = terms.sum()
+        else:
+            terms, _ = comem_loss(soft, tt, True, torch.Generator().manual_seed(5))
+            lam = 0.3 if kind == "treat" else 0.0
+            loss = terms[:3].sum() + (lam * terms[3] if lam else 0.0)          # as Stage1bLoop.step
+        loss.backward()
+        return [tt[0].grad.clone()] + [p.grad.clone() for p in soft.parameters()]
+
+    plain, ctrl, treat = grads("plain"), grads("ctrl"), grads("treat")
+    for g1, g2 in zip(plain, ctrl):
+        assert torch.equal(g1, g2)                                     # control == Stage-1b T, bitwise
+    assert not torch.equal(plain[0], treat[0])                         # the term reaches the trunk (ox)
+
+
+def test_comem_is_part_of_the_resume_identity(tmp_path):
+    base = dict(arm="T", seed=1, lam=1.0, lr=1e-4, head_lr=1e-3, epochs=5, batch_size=32, balance_frac=0.1,
+                limit_train_batches=None, dev_batches="0:150", no_soft_checkpoint=True, resume_every=100,
+                data_path=str(tmp_path / "d.h5"), sem_cons=0.0, comem=0.0, comem_log=False, comem_pairs=2048)
+    mk = lambda **o: type("A", (), {**base, **o})()
+    git = {"git_commit": "c", "git_dirty": False}
+    plain, logged = ft.run_config(mk(), "s", "h", git), ft.run_config(mk(comem_log=True), "s", "h", git)
+    treat = ft.run_config(mk(comem=0.3, comem_log=True), "s", "h", git)
+    assert plain["comem_log"] is False and plain["comem_pairs"] is None
+    assert logged != plain and treat != logged
+    assert {k for k in treat if treat[k] != logged[k]} == {"comem"}      # arms differ only in the weight
+    assert ft.comem_active(mk(comem=0.3)) and not ft.comem_active(mk())
+
+
+class GenToyLoop(ToyLoop):
+    """ToyLoop whose step also consumes a registered private generator (as Stage 1c's pair sampler)."""
+
+    def __init__(self, out, gen_seed=11, **kw):
+        super().__init__(out, **kw)
+        self.gens["pairs"] = torch.Generator().manual_seed(gen_seed)
+
+    def step(self, batch):
+        out = super().step(batch)
+        out["g"] = float(torch.rand(1, generator=self.gens["pairs"]))
+        return out
+
+
+@pytest.mark.parametrize("crash", [{"crash_at_step": 7}, {"crash_at_step": 12}, {"crash_after_epoch": 1}])
+def test_private_generator_is_resumed_exactly(tmp_path, crash):
+    np.random.seed(1)
+    ref = GenToyLoop(tmp_path / "ref")
+    ref.run()
+    np.random.seed(1)
+    with pytest.raises(ft.SimulatedCrash):
+        GenToyLoop(tmp_path / "run").run(**crash)
+    np.random.seed(12345)
+    torch.manual_seed(999)
+    resumed = GenToyLoop(tmp_path / "run", gen_seed=77, init_seed=5)   # other seeds: state must come from resume.pt
+    resumed.load_resume()
+    resumed.run()
+    _check_same(ref, resumed, tmp_path / "ref", tmp_path / "run")
+    assert [r["g"] for r in _steps(tmp_path / "run")] == [r["g"] for r in _steps(tmp_path / "ref")]
+
+
+def test_resume_refuses_a_changed_set_of_private_generators(tmp_path):
+    np.random.seed(1)
+    with pytest.raises(ft.SimulatedCrash):
+        GenToyLoop(tmp_path / "run").run(crash_at_step=4)
+    with pytest.raises(SystemExit, match="private generators"):
+        ToyLoop(tmp_path / "run").load_resume()
