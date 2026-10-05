@@ -45,6 +45,16 @@ def configure():
     parser.add_argument('--precision', type=str, default='32',
                         choices=('32', 'bf16-mixed'),
                         help='Precision for training (default: 32, or bf16-mixed for AMP)')
+    parser.add_argument('--materialize-timing-out', type=str, default=None,
+                        help='Path stem for the THROUGHPUT timer output '
+                             '(enables the continuous-window ThroughputTimer)')
+    parser.add_argument('--epoch-batches', type=int, default=11280,
+                        help='Train batches per epoch, for epoch-time projection')
+    parser.add_argument('--throughput-warmup', type=int, default=10,
+                        help='Warm-up batches before the measured throughput window')
+    parser.add_argument('--throughput-window', type=int, default=0,
+                        help='Batches to measure (0 = to end of epoch); when >0 '
+                             'the run stops right after the window')
     parser = Data.add_data_args(parser)
     parser = Model.add_model_args(parser)
     return parser.parse_args(), Model
@@ -97,6 +107,15 @@ def train(args, Model):
         callbacks.append(LearningRateMonitor(logging_interval='step'))
     if isinstance(logger, pl.loggers.WandbLogger) and not args.offline:
         callbacks.append(ModelCheckpoint(monitor="loss/val", mode="min"))
+    # realistic end-to-end throughput timer (continuous window; no per-op sync).
+    # Profile mode (--materialize-timing) is separate: it only enables the
+    # decoder's per-op timer and does not add this callback.
+    if args.materialize_timing_out:
+        callbacks.append(ng.util.ThroughputTimer(
+            epoch_batches=args.epoch_batches,
+            warmup=args.throughput_warmup,
+            window=args.throughput_window,
+            out_path=args.materialize_timing_out))
 
     # configure plugins
     plugins = [

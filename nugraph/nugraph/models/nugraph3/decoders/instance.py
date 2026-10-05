@@ -5,24 +5,69 @@ import torch
 from torch import nn
 from torchmetrics.functional.clustering import adjusted_rand_score
 from torch_geometric.data import Batch
-from torch_geometric.utils import cumsum, unbatch
-from ....util import ObjConLoss, RecallLoss
-from ..types import Data, N_IT, E_H_IT, N_IP, E_H_IP
+from ....util import ObjConLoss
+from ..types import Data, N_IT, E_H_IT, N_IP
+from ..materialize import (BACKENDS, MaterializeTimer, materialize_labels,
+                           labels_to_particle_graph, has_torch_cluster)
 
 class InstanceDecoder(nn.Module):
     """
     NuGraph3 instance decoder module
 
     Convolve object condensation node embedding into a beta value and a set of
-    coordinates for each hit.
+    coordinates for each hit, then (optionally) materialize discrete particle
+    instances from that latent space.
+
+    Materialization is factored into selectable backends (see
+    ``models/nugraph3/materialize.py``):
+
+    * ``"dbscan"`` -- sklearn CPU DBSCAN (baseline / fallback, default);
+    * ``"seed"``   -- Candidate A, beta-seeded condensation-point assignment;
+    * ``"graph"``  -- Candidate B, radius graph + connected components;
+    * ``"greedy"`` -- Candidate C, sequential greedy condensation (oracle).
+
+    By default materialization runs only during validation/test/inference (the
+    original behaviour). Set ``materialize_train=True`` to also run it during
+    training (every ``materialize_every_n`` steps). Materialization is detached,
+    so enabling it never changes the training loss or gradients.
 
     Args:
         hit_features: Number of hit node features
         instance_features: Number of instance features
+        particle_loss: Enable object-condensation particle loss term
+        materializer: Backend name, one of ``materialize.BACKENDS``
+        materialize_train: Run materialization during training as well
+        materialize_every_n: When training, materialize every N steps
+        t_beta: Seed/greedy condensation-score threshold (seed/greedy backends)
+        t_d: Latent radius (all GPU backends; analogous to DBSCAN eps)
+        min_cluster_size: Drop clusters smaller than this (1 = keep all)
+        dbscan_eps: DBSCAN eps (dbscan backend)
+        dbscan_min_samples: DBSCAN min_samples (dbscan backend)
+        materialize_timing: Enable per-operation timing instrumentation
     """
     def __init__(self, hit_features: int, instance_features: int,
-                 particle_loss: bool = False):
+                 particle_loss: bool = False,
+                 materializer: str = "dbscan",
+                 materialize_train: bool = False,
+                 materialize_every_n: int = 1,
+                 t_beta: float = 0.1,
+                 t_d: float = 0.3,
+                 min_cluster_size: int = 1,
+                 dbscan_eps: float = 0.3,
+                 dbscan_min_samples: int = 15,
+                 materialize_timing: bool = False,
+                 mat_max_pairs: int = 4_000_000,
+                 mat_max_seeds: int = 20_000,
+                 mat_max_edges: int = 8_000_000,
+                 mat_cc_max_iters: int = 200,
+                 mat_max_clusters: int = 20_000,
+                 mat_on_unsafe: str = "flag",
+                 mat_fallback: str = "dbscan",
+                 materialize_metric: bool = True):
         super().__init__()
+
+        if materializer not in BACKENDS:
+            raise ValueError(f"materializer '{materializer}' not in {BACKENDS}")
 
         # loss function
         self.loss = ObjConLoss()
@@ -45,8 +90,76 @@ class InstanceDecoder(nn.Module):
             nn.Linear(hit_features, instance_features),
         )
 
-        self.dbscan = DBSCAN(eps=0.3, min_samples=15)
+        # materialization configuration
+        self.materializer = materializer
+        self.materialize_train = materialize_train
+        self.materialize_every_n = max(1, materialize_every_n)
+        self.t_beta = t_beta
+        self.t_d = t_d
+        self.min_cluster_size = min_cluster_size
+        self.mat_max_pairs = mat_max_pairs
+        self.mat_max_seeds = mat_max_seeds
+        self.mat_max_edges = mat_max_edges
+        self.mat_cc_max_iters = mat_cc_max_iters
+        self.mat_max_clusters = mat_max_clusters
+        if mat_on_unsafe not in ("flag", "raise", "skip", "fallback"):
+            raise ValueError(
+                "mat_on_unsafe must be flag|raise|skip|fallback")
+        self.mat_on_unsafe = mat_on_unsafe
+        if mat_fallback not in ("dbscan", "seed", "graph", "greedy"):
+            raise ValueError("mat_fallback must be a valid backend name")
+        self.mat_fallback = mat_fallback
+        self.materialize_metric = materialize_metric
+        # DBSCAN kept as baseline/fallback backend
+        self.dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples)
         self.particle_loss = particle_loss
+        self.timer = MaterializeTimer(enabled=materialize_timing)
+        # step counter used to schedule train-time materialization
+        self._train_fwd = 0
+
+        if materializer == "graph" and not has_torch_cluster():
+            # not fatal: graph backend has a size-guarded dense fallback
+            print("[InstanceDecoder] torch_cluster not found; the 'graph' "
+                  "backend will use a size-guarded dense fallback.")
+
+    def _foreground_mask(self, h) -> torch.Tensor:
+        """Foreground hit mask: keep signal, non-diffuse hits when available.
+
+        Starts all-True and, when the filter/semantic heads have run, keeps only
+        predicted-signal hits (``x_filter > 0.5``) that are not predicted diffuse
+        (semantic class index 6 in the DUNE 7-class scheme). Returns (n_hit,).
+        """
+        mask = torch.ones_like(h.of, dtype=torch.bool)
+        if hasattr(h, "x_filter"):
+            mask = mask & (h.x_filter > 0.5)
+        if hasattr(h, "x_semantic"):
+            mask = mask & (h.x_semantic.argmax(dim=1) != 6)
+        return mask
+
+    def _rand_score(self, data: Data, valid=None) -> torch.Tensor:
+        """Mean per-graph Adjusted Rand Score of predicted vs true instances.
+
+        Uses the global per-hit predicted (``x_i``) and true (``y_i``) instance
+        ids and slices per graph via the hit ``batch`` vector -- avoiding the
+        expensive ``to_data_list()`` unbatch used previously. Graphs whose
+        materialization was invalid (``valid[g] is False``) are excluded so a
+        failed/degraded clustering is never scored as a real prediction.
+        """
+        h = data["hit"]
+        x_i, y_i = data.x_i(), data.y_i()
+        if isinstance(data, Batch):
+            rand = []
+            for g in range(data.num_graphs):
+                if valid is not None and not valid[g]:
+                    continue
+                gm = (h.batch == g) & (h.y_semantic >= 0)
+                if gm.any():
+                    rand.append(adjusted_rand_score(x_i[gm], y_i[gm]))
+            if not rand:
+                return torch.tensor(0.0, device=h.of.device)
+            return torch.stack(rand).mean()
+        gm = h.y_semantic >= 0
+        return adjusted_rand_score(x_i[gm], y_i[gm])
 
     # pylint: disable=arguments-differ
     def forward(self, data: Data, stage: str = None) -> dict[str, Any]:
@@ -77,7 +190,7 @@ class InstanceDecoder(nn.Module):
         if (self.particle_loss):
             loss_semantic = data.hit_loss()
 
-        # calculate loss
+        # calculate loss (differentiable; independent of materialization)
         loss = self.loss(h.ox, h.of, data.y_i(), h.y_semantic,
                          data[N_IT].num_nodes, data[E_H_IT].edge_index,
                          loss_semantic)
@@ -94,82 +207,118 @@ class InstanceDecoder(nn.Module):
             if self.particle_loss:
                 metrics[f"instance/particle-loss-{stage}"] = p
 
-        if not self.training:
-            # add materialized instances
-            mask = torch.ones_like(h.of, dtype=torch.bool)
-            if hasattr(h, "x_filter"):
-                mask = mask & (h.x_filter > 0.5)
-            if hasattr(h, "x_semantic"):
-                mask = mask & (h.x_semantic.argmax(dim=1) != 6)
-            if isinstance(data, Batch):
-                x_ip, e_h_ip = [], []
-                for ox, m in zip(unbatch(h.ox, h.batch), unbatch(mask, h.batch)):
-                    x, e = self.materialize(ox, m)
-                    x_ip.append(x)
-                    e_h_ip.append(e)
+        # decide whether to materialize discrete instances this step
+        if self.training:
+            do_mat = (self.materialize_train
+                      and (self._train_fwd % self.materialize_every_n == 0))
+            self._train_fwd += 1
+        else:
+            do_mat = True  # always materialize during val/test/inference
 
-                # particle nodes
-                data[N_IP].x = torch.cat(x_ip, dim=0)
-                data[N_IP].batch = torch.cat(
-                    [torch.full((0,), i, dtype=torch.long, device=device) for i, x in enumerate(x_ip)])
-                data[N_IP].ptr = cumsum(torch.tensor([x.size(0) for x in x_ip], device=device))
-                data._slice_dict[N_IP] = {"x": data[N_IP].ptr} # pylint: disable=protected-access
-                data._inc_dict[N_IP] = { # pylint: disable=protected-access
-                    "x": torch.zeros(data.num_graphs, dtype=torch.long, device=device)
-                }
+        if do_mat:
+            self.timer.reset()
+            with self.timer.section("mask"):
+                mask = self._foreground_mask(h)
 
-                # particle edges
-                e_inc = torch.stack((h.ptr[:-1], data[N_IP].ptr[:-1]), dim=1).unsqueeze(2)
-                data[E_H_IP].edge_index = torch.cat([e + inc for e, inc in zip(e_h_ip, e_inc)], dim=1)
-                data._slice_dict[E_H_IP] = { # pylint: disable=protected-access
-                    "edge_index": cumsum(torch.tensor([e.size(1) for e in e_h_ip]))
-                }
-                data._inc_dict[E_H_IP] = {"edge_index": e_inc} # pylint: disable=protected-access
+            # backend -> per-hit event-local labels (-1 = background/noise) plus
+            # per-event MatStatus records (memory-bounded; see materialize.py)
+            ptr = h.ptr if isinstance(data, Batch) else None
+            num_graphs = data.num_graphs if isinstance(data, Batch) else 1
+            with self.timer.section("cluster"):
+                labels, stats = materialize_labels(
+                    self.materializer, h.ox.detach(), h.of.detach(), mask,
+                    ptr, num_graphs, dbscan=self.dbscan,
+                    t_beta=self.t_beta, t_d=self.t_d,
+                    min_cluster_size=self.min_cluster_size,
+                    max_pairs=self.mat_max_pairs, max_seeds=self.mat_max_seeds,
+                    max_edges=self.mat_max_edges,
+                    cc_max_iters=self.mat_cc_max_iters,
+                    max_clusters=self.mat_max_clusters, timer=self.timer)
 
-                # calculate rand score per graph
-                rand = []
-                for l in data.to_data_list():
-                    mask = l["hit"].y_semantic >= 0
-                    rand.append(adjusted_rand_score(l.x_i()[mask], l.y_i()[mask]))
-                rand = torch.stack(rand).mean()
+            # surface safety/health aggregates so limited events are observable
+            n_invalid = sum(1 for s in stats if not s.valid)
+            n_cc_fail = sum(1 for s in stats if s.cc_converged is False)
+            max_temp_mb = max((s.largest_temp_mb for s in stats), default=0.0)
+            used_fallback = False
 
-            else:
-                data[N_IP].x, data[E_H_IP].edge_index = self.materialize(h.ox, mask)
-                rand = adjusted_rand_score(data.x_i(), data.y_i())
+            # explicit configured behaviour when a result is invalid (a
+            # safety-limited clustering is NOT a real prediction)
+            if n_invalid:
+                if self.mat_on_unsafe == "raise":
+                    bad = next(s for s in stats if not s.valid)
+                    raise RuntimeError(
+                        f"Materialization invalid ({bad.status}) on event "
+                        f"{bad.event}: {bad.note}")
+                if self.mat_on_unsafe == "fallback":
+                    with self.timer.section("cluster_fallback"):
+                        labels, stats = materialize_labels(
+                            self.mat_fallback, h.ox.detach(), h.of.detach(),
+                            mask, ptr, num_graphs, dbscan=self.dbscan,
+                            t_beta=self.t_beta, t_d=self.t_d,
+                            min_cluster_size=self.min_cluster_size,
+                            max_pairs=self.mat_max_pairs,
+                            max_seeds=self.mat_max_seeds,
+                            max_edges=self.mat_max_edges,
+                            cc_max_iters=self.mat_cc_max_iters,
+                            max_clusters=self.mat_max_clusters, timer=self.timer)
+                        used_fallback = True
+                        n_invalid = sum(1 for s in stats if not s.valid)
 
-            if not -1. <= rand <= 1.:
-                raise RuntimeError(f"Adjusted Rand Score metric value {rand} is outside allowed range!")
-
+            valid_flags = [s.valid for s in stats]
             if stage:
-                metrics[f"instance/adjusted-rand-{stage}"] = rand
+                metrics[f"instance/mat-invalid-events-{stage}"] = torch.tensor(
+                    float(n_invalid), device=device)
+                metrics[f"instance/mat-cc-not-converged-{stage}"] = torch.tensor(
+                    float(n_cc_fail), device=device)
+                metrics[f"instance/mat-max-temp-mb-{stage}"] = torch.tensor(
+                    float(max_temp_mb), device=device)
+                metrics[f"instance/mat-fallback-used-{stage}"] = torch.tensor(
+                    float(used_fallback), device=device)
+
+            # "skip" mode: do not build particle objects or score when invalid,
+            # just record the failure so it is never mistaken for a prediction
+            if self.mat_on_unsafe == "skip" and n_invalid:
+                if stage:
+                    metrics[f"instance/mat-skipped-{stage}"] = torch.tensor(
+                        1.0, device=device)
+                if stage == "train":
+                    metrics["temperature/instance"] = self.temp
+                return loss, metrics
+
+            # labels -> particle nodes + hit->particle edges (shared, batch-safe)
+            labels_to_particle_graph(data, labels, timer=self.timer)
+
+            # clustering-quality metric (uses truth); skipped in throughput mode
+            # (materialize_metric=False) and always excludes invalid events
+            want_metric = self.materialize_metric and (
+                (not self.training) or self.materialize_train)
+            if want_metric:
+                with self.timer.section("metric"):
+                    rand = self._rand_score(data, valid=valid_flags)
+                if not -1. <= rand <= 1.:
+                    raise RuntimeError(
+                        f"Adjusted Rand Score metric value {rand} is outside "
+                        "allowed range!")
+                if stage:
+                    metrics[f"instance/adjusted-rand-{stage}"] = rand
+            if stage:
+                metrics[f"instance/n-particles-{stage}"] = torch.tensor(
+                    float(data[N_IP].x.size(0)), device=device)
+
+            # surface timing (seconds) as metrics when instrumentation is on
+            if self.timer.enabled and stage:
+                total = 0.0
+                for name, secs in self.timer.times.items():
+                    metrics[f"instance/time-{name}-{stage}"] = torch.tensor(
+                        secs, device=device)
+                    total += secs
+                metrics[f"instance/time-materialize_total-{stage}"] = torch.tensor(
+                    total, device=device)
 
         if stage == "train":
             metrics["temperature/instance"] = self.temp
 
         return loss, metrics
-
-    def materialize(self, ox: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor]:
-        """Materialize instance embedding
-        
-        Args:
-            ox: object condensation embedding tensor
-            mask: bool mask tensor for background hit removal
-        """
-
-        # if there are no signal hits to cluster, skip dbscan and return empty tensors
-        if not mask.sum():
-            x_ip = torch.empty(0, 0, dtype=ox.dtype, device=ox.device)
-            e_h_ip = torch.empty(2, 0, dtype=torch.long, device=ox.device)
-            return x_ip, e_h_ip
-
-        i = torch.empty(ox.size(0), dtype=torch.long, device=ox.device).fill_(-1)
-        arr = ox[mask].detach().to(torch.float32).cpu().numpy()
-        labels = self.dbscan.fit_predict(arr)
-        i[mask] = torch.from_numpy(labels).to(device=ox.device, dtype=torch.long)
-        x_ip = torch.empty(i.max()+1, 0, dtype=ox.dtype, device=ox.device)
-        mask = i > -1
-        e_h_ip = torch.stack((torch.nonzero(mask).squeeze(1), i[mask])).long()
-        return x_ip, e_h_ip
 
     def on_epoch_end(self, logger: "WandbLogger", stage: str, epoch: int) -> None:
         """

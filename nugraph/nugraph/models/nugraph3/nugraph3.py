@@ -60,7 +60,24 @@ class NuGraph3(LightningModule):
                  particle_loss: bool = False,
                  use_checkpointing: bool = False,
                  lr: float = 0.001,
-                 no_one_cycle_sched: bool = False):
+                 no_one_cycle_sched: bool = False,
+                 materializer: str = "dbscan",
+                 materialize_train: bool = False,
+                 materialize_every_n: int = 1,
+                 mat_t_beta: float = 0.1,
+                 mat_t_d: float = 0.3,
+                 mat_min_cluster_size: int = 1,
+                 dbscan_eps: float = 0.3,
+                 dbscan_min_samples: int = 15,
+                 materialize_timing: bool = False,
+                 mat_max_pairs: int = 4_000_000,
+                 mat_max_seeds: int = 20_000,
+                 mat_max_edges: int = 8_000_000,
+                 mat_cc_max_iters: int = 200,
+                 mat_max_clusters: int = 20_000,
+                 mat_on_unsafe: str = "flag",
+                 mat_fallback: str = "dbscan",
+                 materialize_metric: bool = True):
         super().__init__()
 
         warnings.filterwarnings("ignore", ".*NaN values found in confusion matrix.*")
@@ -104,8 +121,25 @@ class NuGraph3(LightningModule):
             self.decoders.append(self.vertex_decoder)
 
         if instance_head:
-            self.instance_decoder = InstanceDecoder(hit_features, instance_features,
-                                                    particle_loss)
+            self.instance_decoder = InstanceDecoder(
+                hit_features, instance_features, particle_loss,
+                materializer=materializer,
+                materialize_train=materialize_train,
+                materialize_every_n=materialize_every_n,
+                t_beta=mat_t_beta,
+                t_d=mat_t_d,
+                min_cluster_size=mat_min_cluster_size,
+                dbscan_eps=dbscan_eps,
+                dbscan_min_samples=dbscan_min_samples,
+                materialize_timing=materialize_timing,
+                mat_max_pairs=mat_max_pairs,
+                mat_max_seeds=mat_max_seeds,
+                mat_max_edges=mat_max_edges,
+                mat_cc_max_iters=mat_cc_max_iters,
+                mat_max_clusters=mat_max_clusters,
+                mat_on_unsafe=mat_on_unsafe,
+                mat_fallback=mat_fallback,
+                materialize_metric=materialize_metric)
             self.decoders.append(self.instance_decoder)
 
         if spacepoint_head:
@@ -248,6 +282,55 @@ class NuGraph3(LightningModule):
         model.add_argument('--no-lr-scheduler', action='store_true',
                            dest="no_one_cycle_sched",
                            help='Disable OneCycleLR scheduler')
+
+        # instance materialization backend selection + parameters
+        mat = parser.add_argument_group(
+            'materialization', 'Instance materialization backend configuration')
+        mat.add_argument('--materializer', type=str, default='dbscan',
+                         choices=('dbscan', 'seed', 'graph', 'greedy'),
+                         help='Instance materialization backend '
+                              '(dbscan=baseline, seed=A, graph=B, greedy=C)')
+        mat.add_argument('--materialize-train', action='store_true',
+                         help='Run materialization during training as well '
+                              '(default: validation/test/inference only)')
+        mat.add_argument('--materialize-every-n', type=int, default=1,
+                         help='When training, materialize every N steps')
+        mat.add_argument('--mat-t-beta', type=float, default=0.1,
+                         help='Condensation-score seed threshold (seed/greedy)')
+        mat.add_argument('--mat-t-d', type=float, default=0.3,
+                         help='Latent radius for GPU backends (like DBSCAN eps)')
+        mat.add_argument('--mat-min-cluster-size', type=int, default=1,
+                         help='Drop clusters smaller than this (1 keeps all)')
+        mat.add_argument('--dbscan-eps', type=float, default=0.3,
+                         help='DBSCAN eps (dbscan backend)')
+        mat.add_argument('--dbscan-min-samples', type=int, default=15,
+                         help='DBSCAN min_samples (dbscan backend)')
+        mat.add_argument('--materialize-timing', action='store_true',
+                         help='Enable per-operation materialization timing')
+        # memory-safety / high-occupancy limits (see materialize.py)
+        mat.add_argument('--mat-max-pairs', type=int, default=4_000_000,
+                         help='Max elements in any pairwise temp (memory budget)')
+        mat.add_argument('--mat-max-seeds', type=int, default=20_000,
+                         help='Cap on candidate seeds (seed backend); explicit '
+                              'top-beta truncation, flagged if reached')
+        mat.add_argument('--mat-max-edges', type=int, default=8_000_000,
+                         help='Cap on radius-graph edges (graph backend)')
+        mat.add_argument('--mat-cc-max-iters', type=int, default=200,
+                         help='Connected-components iteration cap (graph backend)')
+        mat.add_argument('--mat-max-clusters', type=int, default=20_000,
+                         help='Cluster cap for the greedy backend')
+        mat.add_argument('--mat-on-unsafe', type=str, default='flag',
+                         choices=('flag', 'raise', 'skip', 'fallback'),
+                         help='On an invalid/safety-limited result: flag+log '
+                              '(default), raise, skip the batch, or re-run with '
+                              '--mat-fallback backend')
+        mat.add_argument('--mat-fallback', type=str, default='dbscan',
+                         choices=('dbscan', 'seed', 'graph', 'greedy'),
+                         help='Fallback backend when --mat-on-unsafe fallback')
+        mat.add_argument('--no-materialize-metric', dest='materialize_metric',
+                         action='store_false',
+                         help='Throughput mode: skip the ARI quality metric '
+                              'during materialization')
         return parser
 
     @classmethod
@@ -278,4 +361,21 @@ class NuGraph3(LightningModule):
             particle_loss=args.particle_loss,
             use_checkpointing=args.use_checkpointing,
             lr=args.learning_rate,
-            no_one_cycle_sched=args.no_one_cycle_sched)
+            no_one_cycle_sched=args.no_one_cycle_sched,
+            materializer=args.materializer,
+            materialize_train=args.materialize_train,
+            materialize_every_n=args.materialize_every_n,
+            mat_t_beta=args.mat_t_beta,
+            mat_t_d=args.mat_t_d,
+            mat_min_cluster_size=args.mat_min_cluster_size,
+            dbscan_eps=args.dbscan_eps,
+            dbscan_min_samples=args.dbscan_min_samples,
+            materialize_timing=args.materialize_timing,
+            mat_max_pairs=args.mat_max_pairs,
+            mat_max_seeds=args.mat_max_seeds,
+            mat_max_edges=args.mat_max_edges,
+            mat_cc_max_iters=args.mat_cc_max_iters,
+            mat_max_clusters=args.mat_max_clusters,
+            mat_on_unsafe=args.mat_on_unsafe,
+            mat_fallback=args.mat_fallback,
+            materialize_metric=args.materialize_metric)
